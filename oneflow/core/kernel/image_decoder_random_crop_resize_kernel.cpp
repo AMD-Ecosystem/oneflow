@@ -28,14 +28,16 @@ limitations under the License.
 
 #include <cuda.h>
 
-#if CUDA_VERSION >= 10020
+// nvJPEG + NPP are NVIDIA-only (no ROCm equivalent); the GPU JPEG-decode path keyed on
+// WITH_NVJPEG is unavailable on ROCm. The CPU decode path remains.
+#if CUDA_VERSION >= 10020 && !defined(USE_HIP)
 
 #define WITH_NVJPEG
 
 #include <nvjpeg.h>
 #include <npp.h>
 
-#endif  // CUDA_VERSION >= 10020
+#endif  // CUDA_VERSION >= 10020 && !USE_HIP
 
 #endif  // WITH_CUDA
 

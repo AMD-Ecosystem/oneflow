@@ -150,7 +150,7 @@ struct NdarrayReduceCore final {
     size_t n = dst_reduced.shape().ElemNum();
     int64_t dst_dim_val = dst_reduced.shape().At(axis);
     XPU_1D_KERNEL_LOOP_BEGIN(i, n);
-    T* dst_reduced_ptr = dst_reduced.template Mut(i);
+    T* dst_reduced_ptr = dst_reduced.Mut(i);
     int64_t coord[NDIMS];
     dst_reduced.shape().template Offset2Coordinate<NDIMS>(i, coord);
     T reduced = UnitOfBinaryFunc<T, binary_func>::Val();

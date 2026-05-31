@@ -16,7 +16,10 @@ limitations under the License.
 #ifndef ONEFLOW_CORE_DEVICE_CUDNN_CONV_UTIL_H_
 #define ONEFLOW_CORE_DEVICE_CUDNN_CONV_UTIL_H_
 
-#ifdef WITH_CUDA
+// cuDNN has no MIOpen drop-in (different descriptor/algo-find API); the cuDNN conv path is
+// deferred on ROCm, so this header's cuDNN-typed declarations are gated out under USE_HIP
+// (matches cudnn_util.h). Host TUs that include it transitively then still parse.
+#if defined(WITH_CUDA) && !defined(USE_HIP)
 
 #include "oneflow/core/device/cudnn_util.h"
 #include "oneflow/core/common/protobuf.h"
