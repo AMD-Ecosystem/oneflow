@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# MOAT ROCm/HIP build for oneflow (lead platform gfx90a).
-# Strategy A: BUILD_CUDA stays ON (defines WITH_CUDA, the GPU backend == kCUDA reached
+# ROCm/HIP build for oneflow (gfx90a).
+# BUILD_CUDA stays ON (defines WITH_CUDA, the GPU backend == kCUDA reached
 # through HIP); USE_HIP routes the toolkit/library/.cu-language plumbing to ROCm.
 # Usage: ./build_rocm.sh [config|tp|oneflow|all]   (default: all)
 set -uo pipefail

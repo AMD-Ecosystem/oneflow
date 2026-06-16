@@ -1,7 +1,7 @@
 include(python)
 
 # Retag a target's .cu/.cuh sources to LANGUAGE HIP and set its HIP_ARCHITECTURES.
-# Used under USE_HIP (Strategy A) so the existing .cu compile through hipcc with no
+# Used under USE_HIP so the existing .cu compile through hipcc with no
 # file renames; the CUDA build is a pure passthrough.
 function(of_retag_cuda_sources_as_hip target)
   get_target_property(_of_srcs ${target} SOURCES)

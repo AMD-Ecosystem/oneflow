@@ -1,5 +1,5 @@
 if(BUILD_CUDA AND USE_HIP)
-  # MOAT ROCm/HIP backend (Strategy A). BUILD_CUDA stays ON so -DWITH_CUDA is defined
+  # ROCm/HIP backend. BUILD_CUDA stays ON so -DWITH_CUDA is defined
   # and the .cu glob is included; the GPU backend is reached through HIP, with kCUDA
   # still denoting "the GPU backend". Only .cu/.cuh translation units see the HIP
   # toolchain; host C++ is untouched. See oneflow/core/device/cuda_to_hip.h.

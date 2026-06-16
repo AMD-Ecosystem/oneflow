@@ -16,7 +16,7 @@ limitations under the License.
 #ifndef ONEFLOW_CORE_DEVICE_CUDA_TO_HIP_H_
 #define ONEFLOW_CORE_DEVICE_CUDA_TO_HIP_H_
 
-// Single CUDA-to-HIP compatibility header (MOAT Strategy A). It is force-included
+// Single CUDA-to-HIP compatibility header. It is force-included
 // on every HIP translation unit (CMAKE_HIP_FLAGS -include ...), so the aliases and
 // macro shims below precede each file's own includes regardless of include order.
 // On a real CUDA build this file is never compiled (it is gated on USE_HIP) and the
