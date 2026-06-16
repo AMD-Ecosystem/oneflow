@@ -20,7 +20,7 @@ limitations under the License.
 // on every HIP translation unit (CMAKE_HIP_FLAGS -include ...), so the aliases and
 // macro shims below precede each file's own includes regardless of include order.
 // On a real CUDA build this file is never compiled (it is gated on USE_HIP) and the
-// NVIDIA path is byte-for-byte unchanged.
+// NVIDIA path is unchanged.
 //
 // oneflow's whole GPU backend is gated on WITH_CUDA; we define WITH_CUDA FOR the HIP
 // build (see cmake/cuda.cmake) so the ~200 shared host/device blocks compile unchanged
