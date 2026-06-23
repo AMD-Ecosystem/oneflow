@@ -6,9 +6,8 @@ if(BUILD_CUDA AND USE_HIP)
   add_definitions(-DWITH_CUDA)
   add_definitions(-DUSE_HIP)
 
-  if(NOT DEFINED CMAKE_HIP_ARCHITECTURES OR CMAKE_HIP_ARCHITECTURES STREQUAL "")
-    set(CMAKE_HIP_ARCHITECTURES "gfx90a") # default the lead arch only when unset
-  endif()
+  # enable_language(HIP) honors an explicit -DCMAKE_HIP_ARCHITECTURES, otherwise
+  # auto-detects the host GPU(s), and errors on a no-GPU build host.
   enable_language(HIP)
   message(STATUS "CMAKE_HIP_ARCHITECTURES: ${CMAKE_HIP_ARCHITECTURES}")
   message(STATUS "CMAKE_HIP_COMPILER: ${CMAKE_HIP_COMPILER}")
