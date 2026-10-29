@@ -77,7 +77,9 @@ class GridSampleKernel final : public user_op::OpKernel {
 
 REGISTER_GRID_SAMPLE_KERNEL(DeviceType::kCPU, float);
 REGISTER_GRID_SAMPLE_KERNEL(DeviceType::kCPU, double);
-#ifdef WITH_CUDA
+// The GPU GridSampleKernelUtil lives in grid_sample_kernel_util.cu, deferred on ROCm
+// (the spatial-transformer kernel has no MIOpen drop-in); register only CPU on HIP.
+#if defined(WITH_CUDA) && !defined(USE_HIP)
 REGISTER_GRID_SAMPLE_KERNEL(DeviceType::kCUDA, float);
 REGISTER_GRID_SAMPLE_KERNEL(DeviceType::kCUDA, double);
 #endif
@@ -142,7 +144,7 @@ class GridSampleGradKernel final : public user_op::OpKernel {
 
 REGISTER_GRID_SAMPLE_GRAD_KERNEL(DeviceType::kCPU, float);
 REGISTER_GRID_SAMPLE_GRAD_KERNEL(DeviceType::kCPU, double);
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) && !defined(USE_HIP)
 REGISTER_GRID_SAMPLE_GRAD_KERNEL(DeviceType::kCUDA, float);
 REGISTER_GRID_SAMPLE_GRAD_KERNEL(DeviceType::kCUDA, double);
 #endif

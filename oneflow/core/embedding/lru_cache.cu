@@ -33,10 +33,28 @@ namespace embedding {
 
 namespace {
 
+// This LRU cache maps one set of 32 ways onto one warp (one way per lane), so kWarpSize
+// stays 32 here: on a 64-lane CDNA wavefront lanes 32-63 are simply inactive (their ballot
+// bits are 0), which keeps the 32-way design correct without a redesign. HIP's
+// __ballot/__shfl_sync require a 64-bit mask (ROCm 7.x static_assert), so the mask is
+// 64-bit and the ballot results are folded with the 64-bit __ffsll/__popcll via the
+// helpers below; the low 32 bits carry the active ways.
 constexpr int kWarpSize = 32;
 constexpr int kNumWarpPerBlock = 4;
 constexpr int kBlockSize = kNumWarpPerBlock * kWarpSize;
+#if defined(USE_HIP)
+constexpr uint64_t kFullMask = 0xFFFFFFFFFFFFFFFFULL;
+__device__ __forceinline__ int OfWarpFfs(uint64_t mask) {
+  return __ffsll(static_cast<unsigned long long>(mask));
+}
+__device__ __forceinline__ int OfWarpPopc(uint64_t mask) {
+  return __popcll(static_cast<unsigned long long>(mask));
+}
+#else
 constexpr uint32_t kFullMask = 0xFFFFFFFFU;
+__device__ __forceinline__ int OfWarpFfs(unsigned mask) { return __ffs(mask); }
+__device__ __forceinline__ int OfWarpPopc(unsigned mask) { return __popc(mask); }
+#endif
 
 ep::CudaLaunchConfig GetLaunchConfig(uint32_t n_keys) {
   return ep::CudaLaunchConfig((n_keys + kNumWarpPerBlock - 1) / kNumWarpPerBlock,
@@ -221,9 +239,9 @@ struct SetContext {
     const Key lane_key = keys[thread_ctx.lane_id];
     const int lane_age = ages[thread_ctx.lane_id];
     const bool lane_hit = (lane_key == key && lane_age != 0);
-    const unsigned hit_mask = __ballot_sync(kFullMask, lane_hit);
+    const auto hit_mask = __ballot_sync(kFullMask, lane_hit);
     if (hit_mask != 0) {
-      return __ffs(static_cast<int>(hit_mask)) - 1;
+      return OfWarpFfs(hit_mask) - 1;
     } else {
       return -1;
     }
@@ -242,9 +260,9 @@ struct SetContext {
     int insert_way = -1;
     const Key lane_key = keys[thread_ctx.lane_id];
     int lane_age = ages[thread_ctx.lane_id];
-    const unsigned hit_mask = __ballot_sync(kFullMask, lane_key == key && lane_age != 0);
+    const auto hit_mask = __ballot_sync(kFullMask, lane_key == key && lane_age != 0);
     if (hit_mask != 0) {
-      insert_way = __ffs(static_cast<int>(hit_mask)) - 1;
+      insert_way = OfWarpFfs(hit_mask) - 1;
       const int insert_way_age = __shfl_sync(kFullMask, lane_age, insert_way);
       if (lane_age > insert_way_age) {
         lane_age -= 1;
@@ -254,9 +272,10 @@ struct SetContext {
       __syncwarp();
     }
     if (insert_way == -1) {
-      const unsigned valid_mask = __ballot_sync(kFullMask, lane_age != 0);
-      if (valid_mask != kFullMask) {
-        insert_way = __popc(static_cast<int>(valid_mask));
+      // Active ways occupy the low kWarpSize bits of the (possibly 64-wide) ballot.
+      const auto valid_mask = __ballot_sync(kFullMask, lane_age != 0);
+      if (OfWarpPopc(valid_mask) != kWarpSize) {
+        insert_way = OfWarpPopc(valid_mask);
         if (lane_age > 0) {
           lane_age -= 1;
         } else if (thread_ctx.lane_id == insert_way) {
@@ -274,7 +293,7 @@ struct SetContext {
                         const ThreadContext& thread_ctx, Key key, int* way, Key* evicted_key) {
     const Key lane_key = keys[thread_ctx.lane_id];
     int lane_age = ages[thread_ctx.lane_id];
-    const int insert_way = __ffs(__ballot_sync(kFullMask, lane_age == 1)) - 1;
+    const int insert_way = OfWarpFfs(__ballot_sync(kFullMask, lane_age == 1)) - 1;
     *evicted_key = __shfl_sync(kFullMask, lane_key, insert_way);
     if (thread_ctx.lane_id == insert_way) {
       keys[insert_way] = key;
@@ -470,7 +489,7 @@ __global__ void DumpKernel(LruCacheContext<Key, Elem> cache_ctx, size_t start_ke
     __syncwarp();
     warp_keys[thread_ctx.warp_id_in_block][thread_ctx.lane_id] = lane_key;
     warp_ages[thread_ctx.warp_id_in_block][thread_ctx.lane_id] = lane_age;
-    const int key_count = __popc(__ballot_sync(kFullMask, lane_age != 0));
+    const int key_count = OfWarpPopc(__ballot_sync(kFullMask, lane_age != 0));
     if (key_count == 0) { continue; }
     uint32_t offset = 0;
     if (thread_ctx.lane_id == 0) { offset = atomicAdd(n_dumped, key_count); }

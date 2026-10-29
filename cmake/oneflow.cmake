@@ -1,12 +1,38 @@
 include(python)
 
+# Retag a target's .cu/.cuh sources to LANGUAGE HIP and set its HIP_ARCHITECTURES.
+# Used under USE_HIP so the existing .cu compile through hipcc with no
+# file renames; the CUDA build is a pure passthrough.
+function(of_retag_cuda_sources_as_hip target)
+  get_target_property(_of_srcs ${target} SOURCES)
+  if(NOT _of_srcs)
+    return()
+  endif()
+  set(_of_hip_srcs)
+  foreach(_of_src ${_of_srcs})
+    if("${_of_src}" MATCHES "\\.(cu|cuh)$")
+      list(APPEND _of_hip_srcs ${_of_src})
+    endif()
+  endforeach()
+  if(_of_hip_srcs)
+    set_source_files_properties(${_of_hip_srcs} TARGET_DIRECTORY ${target} PROPERTIES LANGUAGE HIP)
+    set_target_properties(${target} PROPERTIES HIP_ARCHITECTURES "${CMAKE_HIP_ARCHITECTURES}")
+  endif()
+endfunction()
+
 function(oneflow_add_executable)
   add_executable(${ARGV})
+  if(USE_HIP)
+    of_retag_cuda_sources_as_hip(${ARGV0})
+  endif()
   set_compile_options_to_oneflow_target(${ARGV0})
 endfunction()
 
 function(oneflow_add_library)
   add_library(${ARGV})
+  if(USE_HIP)
+    of_retag_cuda_sources_as_hip(${ARGV0})
+  endif()
   set_compile_options_to_oneflow_target(${ARGV0})
 endfunction()
 
@@ -220,6 +246,43 @@ endif(BUILD_PYTHON)
 include_directories(${PROJECT_SOURCE_DIR}) # TO FIND: third_party/eigen3/..
 include_directories(${PROJECT_BINARY_DIR})
 
+if(USE_HIP)
+  # Deferred GPU TUs excluded from the HIP monolith (a later slice ports them). Each has a
+  # genuine library/API gap, not a mechanical port:
+  #  - cuDNN ops with no MIOpen drop-in: spatial-transformer grid_sample, cuDNN batchnorm
+  #    normalization (MIOpen has a different descriptor/algo-find API);
+  #  - the cuBLASLt fused-MLP / grouped-GEMM / matmul-bias family (hipBLASLt API differs:
+  #    hipblasLtMatmul descriptor surface and hipblasGemmStridedBatchedEx signature);
+  #  - cuSOLVER lu_decomposition (getrf/getrs; deferred to hipSOLVER);
+  #  - the CUTLASS/CuTe + wmma fused kernels (CUTLASS does not port to ROCm; would be a
+  #    Composable-Kernel reimplementation) and the TensorRT-flash self-attention kernel;
+  #  - lru_cache (uses libcu++ cuda::std::semaphore, which has no ROCm equivalent) and the
+  #    one_embedding P2P/IPC shuffle kernels.
+  # Everything else (the ep/cuda/primitive tensor-op validation slice and the bulk of
+  # user/kernels) compiles as HIP. See projects/oneflow/notes.md for the fault-class status.
+  list(FILTER of_all_obj_cc EXCLUDE REGEX
+       "oneflow/user/kernels/(grid_sample_kernel_util|normalization_kernel|grouped_matmul_bias|fused_matmul_bias_add_relu_dropout|fused_matmul_bias_kernel|cublas_fused_mlp_kernel|cublas_fused_mlp_grad_kernel|cublas_bias_add_relu_matmul_grad_kernel|cublas_fused_matmul_bias_add_grad|lu_decomposition_kernel|fused_dot_feature_interaction_kernel|fused_self_attention_query_mul_key_and_value_kernel|fused_attention_kernels|fused_glu_kernel|fused_multi_head_attention_inference_kernel|one_embedding_embedding_shuffle_p2p_kernel|one_embedding_embedding_gradient_shuffle_p2p_kernel)\\.cu$")
+  list(FILTER of_all_obj_cc EXCLUDE REGEX "oneflow/core/embedding/lru_cache\\.cu$")
+  # cuDNN host TUs: the conv / deconv / TF-pooling kernels and the cuDNN descriptor/conv
+  # utilities call cuDNN ops with no MIOpen drop-in (different descriptor/algo-find API),
+  # so they are deferred like the cuDNN .cu kernels above. Their ops remain registered
+  # (the op-definition TUs in user/ops stay), but have no GPU kernel on ROCm yet.
+  list(FILTER of_all_obj_cc EXCLUDE REGEX
+       "oneflow/core/device/(cudnn_conv_util|cudnn_util)\\.cpp$")
+  list(FILTER of_all_obj_cc EXCLUDE REGEX
+       "oneflow/user/kernels/(conv_cudnn_kernels|deconv_cudnn_kernel|tf_pool_gpu_kernel)\\.cpp$")
+  # oneflow's source glob compiles every .cuh as a standalone TU. Three .cuh are not
+  # self-contained -- they live inside namespace oneflow::cuda and use symbols their .cu
+  # includer pulled in first (cuda::softmax::Pack for fused_softmax; ep::primitive::CopyNd
+  # for one_embedding_data_shuffle; the cublasLt descriptor types for cublas_fused_mlp_util)
+  # without including the defining headers themselves. nvcc tolerates the standalone pass;
+  # clang does not. Their code is still built inside the .cu that include them (the
+  # cublas_fused_mlp_util consumers are all deferred anyway), so drop only the redundant
+  # standalone compile. The other 16 .cuh are self-contained and compile as HIP.
+  list(FILTER of_all_obj_cc EXCLUDE REGEX
+       "oneflow/user/kernels/(fused_softmax|one_embedding_data_shuffle|cublas_fused_mlp_util)\\.cuh$")
+endif()
+
 # cc obj lib
 oneflow_add_library(oneflow SHARED ${of_all_obj_cc})
 
@@ -298,6 +361,15 @@ endif()
 check_variable_defined(LLVM_INCLUDE_DIRS)
 set_property(TARGET LLVMSupportWithHeader PROPERTY INTERFACE_INCLUDE_DIRECTORIES
                                                    ${LLVM_INCLUDE_DIRS})
+# When the monolith is compiled with the ROCm clang, that toolchain's bundled
+# llvm/Config/abi-breaking.h (LLVM_ENABLE_ABI_BREAKING_CHECKS=0) is found on clang's
+# builtin header path ahead of oneflow's vendored LLVM headers (=1), so every TU emits an
+# extern reference to llvm::DisableABIBreakingChecks while the linked libLLVMSupport (built
+# =1) only defines EnableABIBreakingChecks -> liboneflow.so fails to load with an undefined
+# symbol. LLVM provides this macro precisely to drop the link-time enforcement symbol when
+# only ADT/Support headers are used; defining it sidesteps the spurious mismatch.
+set_property(TARGET LLVMSupportWithHeader PROPERTY INTERFACE_COMPILE_DEFINITIONS
+                                                   LLVM_DISABLE_ABI_BREAKING_CHECKS_ENFORCING=1)
 
 list(APPEND oneflow_third_party_libs LLVMSupportWithHeader)
 
@@ -334,7 +406,9 @@ elseif(UNIX)
     -Wl,--as-needed
     -ldl
     -lrt)
-  if(BUILD_CUDA)
+  if(BUILD_CUDA AND USE_HIP)
+    target_link_libraries(oneflow hip::host)
+  elseif(BUILD_CUDA)
     target_link_libraries(oneflow CUDA::cudart_static)
   endif()
   if(WITH_OMP)
@@ -468,7 +542,9 @@ file(RELATIVE_PATH PROJECT_BINARY_DIR_RELATIVE ${PROJECT_SOURCE_DIR} ${PROJECT_B
 function(oneflow_add_test target_name)
   cmake_parse_arguments(arg "" "TEST_NAME;WORKING_DIRECTORY" "SRCS" ${ARGN})
   oneflow_add_executable(${target_name} ${arg_SRCS})
-  if(BUILD_CUDA)
+  if(BUILD_CUDA AND USE_HIP)
+    target_link_libraries(${target_name} hip::host)
+  elseif(BUILD_CUDA)
     target_link_libraries(${target_name} CUDA::cudart_static)
   endif()
   set_target_properties(${target_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY

@@ -20,7 +20,9 @@ limitations under the License.
 #ifdef WITH_CUDA
 
 #include <cuda_runtime.h>
+#if !defined(USE_HIP)
 #include <cudnn.h>
+#endif  // !USE_HIP
 #include <nccl.h>
 
 namespace oneflow {
@@ -33,6 +35,8 @@ std::string GetCudaVersionString(int version) {
   return std::to_string(version / 1000) + "." + std::to_string((version % 1000) / 10);
 }
 
+#if !defined(USE_HIP)
+// cuDNN (MIOpen on ROCm) is deferred; skip the cuDNN version banner on HIP.
 bool GetCudnnVersion(libraryPropertyType type, int* version) {
   cudnnStatus_t status = cudnnGetProperty(type, version);
   if (status == CUDNN_STATUS_SUCCESS) {
@@ -54,6 +58,7 @@ bool GetCudnnVersionString(std::string* version) {
              + std::to_string(version_patch);
   return true;
 }
+#endif  // !USE_HIP
 
 void CudaDumpVersionInfo() {
   {
@@ -66,12 +71,14 @@ void CudaDumpVersionInfo() {
     }
   }
 
+#if !defined(USE_HIP)
   {
     std::string cudnn_version_string;
     if (GetCudnnVersionString(&cudnn_version_string)) {
       LOG(INFO) << "cuDNN version: " << cudnn_version_string;
     }
   }
+#endif  // !USE_HIP
 
   {
     int nccl_version = 0;
