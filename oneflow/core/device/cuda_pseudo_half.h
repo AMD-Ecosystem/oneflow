@@ -23,8 +23,8 @@ limitations under the License.
 #include <cuda_runtime_api.h>
 
 // HIP's __half (hip_fp16.h) already provides the full operator/intrinsic set these
-// macros emulate for pre-sm53 CUDA, so on HIP this body would redefine them and clash
-// (the HIP-vector-type-provides-operators fault class). Skip it under USE_HIP.
+// macros emulate for pre-sm53 CUDA, so on HIP this body would redefine those operators
+// and fail to compile. Skip it under USE_HIP.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 530 && !defined(USE_HIP)
 
 #define DEFINE_CUDA_PSEUDO_HALF_ARITHMETIC_BINARY_OPERATOR(op)                        \

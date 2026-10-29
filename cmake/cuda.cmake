@@ -46,7 +46,7 @@ if(BUILD_CUDA AND USE_HIP)
   # each .cu (the warp-tiled reductions in core/cuda/{softmax,layer_norm,rms_norm}.cuh
   # use it as a kernel template arg, so it must be one compile-time constant; __GFX9__
   # is set only in the device pass and cannot be used). CDNA (gfx9xx) is 64; RDNA
-  # (gfx10xx/gfx11xx) is 32. Followers override only -DCMAKE_HIP_ARCHITECTURES.
+  # (gfx10xx/gfx11xx) is 32. Other GPUs change only -DCMAKE_HIP_ARCHITECTURES.
   set(_of_warp 32)
   foreach(_of_arch ${CMAKE_HIP_ARCHITECTURES})
     if("${_of_arch}" MATCHES "^gfx9")
