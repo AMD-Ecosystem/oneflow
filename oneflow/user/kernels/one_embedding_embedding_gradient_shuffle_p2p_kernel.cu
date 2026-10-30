@@ -97,10 +97,21 @@ __global__ void BarrierKernel(int32_t parallel_id, int32_t parallel_num,
                               Param<T, IDX, pack_size, N> param) {
   int count = param.is_kernel_start[parallel_id][parallel_id];
   if (threadIdx.x < parallel_num) {
+#if defined(USE_HIP)
+    // The flags are read by peer GPUs across the fabric. System-scope release and acquire write
+    // back and invalidate this GPU's L2, so neither side spins on a stale cached copy, and the
+    // data the peers read after the barrier is visible to them.
+    __hip_atomic_store(param.is_kernel_start[parallel_id] + threadIdx.x, count + 1,
+                       __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    while (__hip_atomic_load(param.is_kernel_start[threadIdx.x] + parallel_id, __ATOMIC_ACQUIRE,
+                             __HIP_MEMORY_SCOPE_SYSTEM)
+           < count + 1) {}
+#else
     volatile int32_t* start_f = param.is_kernel_start[parallel_id];
     volatile int32_t* remote_start_f = param.is_kernel_start[threadIdx.x];
     start_f[threadIdx.x] = count + 1;
     while (remote_start_f[parallel_id] < count + 1) {}
+#endif  // defined(USE_HIP)
   }
 }
 
@@ -124,9 +135,13 @@ void GetPtrs(user_op::KernelComputeContext* ctx,
                                       unique_partitioned_embedding_grad_ptr->at(parallel_id)));
     OF_CUDA_CHECK(cudaIpcGetMemHandle(&push_handle_offset.at(1).handle,
                                       is_kernel_start_ptr->at(parallel_id)));
+#if defined(USE_HIP)
+    auto* func = &hipPointerGetAttribute;
+#else
     cudaError_t (*func)(void*, CUpointer_attribute, CUdeviceptr);
     OF_CUDA_CHECK(
         cudaGetDriverEntryPoint("cuPointerGetAttribute", (void**)(&func), cudaEnableDefault));
+#endif  // defined(USE_HIP)
     void* embedding_grad_base;
     OF_CUDA_CHECK(func(&embedding_grad_base, CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
                        (CUdeviceptr)(unique_partitioned_embedding_grad_ptr->at(parallel_id))));

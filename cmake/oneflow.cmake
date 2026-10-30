@@ -247,15 +247,6 @@ include_directories(${PROJECT_SOURCE_DIR}) # TO FIND: third_party/eigen3/..
 include_directories(${PROJECT_BINARY_DIR})
 
 if(USE_HIP)
-  # GPU TUs excluded from the HIP monolith because they are not ported yet. Each has a
-  # genuine library/API gap, not a mechanical port:
-  #  - the CUTLASS/CuTe + wmma fused kernels (CUTLASS does not port to ROCm; would be a
-  #    Composable-Kernel reimplementation);
-  #  - the one_embedding P2P/IPC shuffle kernels.
-  # Everything else (the ep/cuda/primitive tensor ops and the bulk of user/kernels)
-  # compiles as HIP.
-  list(FILTER of_all_obj_cc EXCLUDE REGEX
-       "oneflow/user/kernels/(fused_multi_head_attention_inference_kernel|one_embedding_embedding_shuffle_p2p_kernel|one_embedding_embedding_gradient_shuffle_p2p_kernel)\\.cu$")
   # oneflow's source glob compiles every .cuh as a standalone TU. Three .cuh are not
   # self-contained -- they live inside namespace oneflow::cuda and use symbols their .cu
   # includer pulled in first (cuda::softmax::Pack for fused_softmax; ep::primitive::CopyNd

@@ -201,6 +201,8 @@ limitations under the License.
 #define cudaIpcGetMemHandle hipIpcGetMemHandle
 #define cudaIpcOpenMemHandle hipIpcOpenMemHandle
 #define cudaIpcMemLazyEnablePeerAccess hipIpcMemLazyEnablePeerAccess
+#define CUdeviceptr hipDeviceptr_t
+#define CU_POINTER_ATTRIBUTE_RANGE_START_ADDR HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR
 
 #define cudaFuncAttributes hipFuncAttributes
 #define cudaFuncGetAttributes hipFuncGetAttributes
