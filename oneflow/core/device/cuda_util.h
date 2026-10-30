@@ -22,8 +22,8 @@ limitations under the License.
 
 #include <cublas_v2.h>
 #if !defined(USE_HIP)
-// cuSOLVER/cuDNN/nvjpeg are deferred on ROCm (cuSOLVER unused in the first slice; MIOpen
-// is not a cuDNN drop-in; nvjpeg/npp image decode is NVIDIA-only). The TUs that use them
+// cuSOLVER/cuDNN/nvjpeg are deferred on ROCm (cuSOLVER is used only by excluded kernels;
+// MIOpen is not a cuDNN drop-in; nvjpeg/npp image decode is NVIDIA-only). The TUs that use them
 // are excluded from the HIP monolith glob (see cmake/oneflow.cmake), so their error-string
 // helpers and the headers below are gated out under USE_HIP.
 #if CUDA_VERSION >= 11000

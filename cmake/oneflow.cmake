@@ -247,7 +247,7 @@ include_directories(${PROJECT_SOURCE_DIR}) # TO FIND: third_party/eigen3/..
 include_directories(${PROJECT_BINARY_DIR})
 
 if(USE_HIP)
-  # Deferred GPU TUs excluded from the HIP monolith (a later slice ports them). Each has a
+  # GPU TUs excluded from the HIP monolith because they are not ported yet. Each has a
   # genuine library/API gap, not a mechanical port:
   #  - cuDNN ops with no MIOpen drop-in: spatial-transformer grid_sample, cuDNN batchnorm
   #    normalization (MIOpen has a different descriptor/algo-find API);
@@ -258,8 +258,8 @@ if(USE_HIP)
   #    Composable-Kernel reimplementation) and the TensorRT-flash self-attention kernel;
   #  - lru_cache (uses libcu++ cuda::std::semaphore, which has no ROCm equivalent) and the
   #    one_embedding P2P/IPC shuffle kernels.
-  # Everything else (the ep/cuda/primitive tensor-op validation slice and the bulk of
-  # user/kernels) compiles as HIP. See projects/oneflow/notes.md for the fault-class status.
+  # Everything else (the ep/cuda/primitive tensor ops and the bulk of user/kernels)
+  # compiles as HIP.
   list(FILTER of_all_obj_cc EXCLUDE REGEX
        "oneflow/user/kernels/(grid_sample_kernel_util|normalization_kernel|grouped_matmul_bias|fused_matmul_bias_add_relu_dropout|fused_matmul_bias_kernel|cublas_fused_mlp_kernel|cublas_fused_mlp_grad_kernel|cublas_bias_add_relu_matmul_grad_kernel|cublas_fused_matmul_bias_add_grad|lu_decomposition_kernel|fused_dot_feature_interaction_kernel|fused_self_attention_query_mul_key_and_value_kernel|fused_attention_kernels|fused_glu_kernel|fused_multi_head_attention_inference_kernel|one_embedding_embedding_shuffle_p2p_kernel|one_embedding_embedding_gradient_shuffle_p2p_kernel)\\.cu$")
   list(FILTER of_all_obj_cc EXCLUDE REGEX "oneflow/core/embedding/lru_cache\\.cu$")

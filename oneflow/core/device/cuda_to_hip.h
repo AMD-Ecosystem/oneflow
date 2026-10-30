@@ -38,8 +38,8 @@ limitations under the License.
 #define __HIP_PLATFORM_AMD__
 #endif
 
-// libc host decls must win over HIP's __device__ memcpy/memset overloads once the HIP
-// runtime is in scope (gpuRIR lesson): include them before <hip/hip_runtime.h>.
+// libc host declarations must be seen before HIP's __device__ memcpy/memset overloads,
+// so include them before <hip/hip_runtime.h>.
 #include <cstring>
 #include <cstdlib>
 
@@ -67,8 +67,8 @@ limitations under the License.
 // __CUDA_ARCH__ is undefined during HIP device compilation (HIP uses
 // __HIP_DEVICE_COMPILE__). Many device-vs-host #ifdef __CUDA_ARCH__ selections would
 // otherwise silently take the host branch in the device pass. Define __CUDA_ARCH__ in
-// the HIP device pass only (1 in device pass, absent in host pass), matching the raft
-// pattern. Numeric `#if __CUDA_ARCH__ >= NNN` intrinsic gates are separately guarded
+// the HIP device pass only (1 in device pass, absent in host pass).
+// Numeric `#if __CUDA_ARCH__ >= NNN` intrinsic gates are separately guarded
 // with !defined(USE_HIP) at their sites so the portable fallback runs.
 #if defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__ && !defined(__CUDA_ARCH__)
 #define __CUDA_ARCH__ 1
@@ -76,14 +76,13 @@ limitations under the License.
 
 // Eigen has a native HIP device path keyed on __HIP_DEVICE_COMPILE__. Defining
 // __CUDA_ARCH__ above would otherwise steer Eigen into its CUDA path and pull in the
-// absent <math_constants.h>; EIGEN_NO_CUDA makes Eigen fall through to its HIP path
-// (MPPI lesson).
+// absent <math_constants.h>; EIGEN_NO_CUDA makes Eigen fall through to its HIP path.
 #ifndef EIGEN_NO_CUDA
 #define EIGEN_NO_CUDA
 #endif
 
 // Full-warp lane mask. ROCm 7.x __shfl_*_sync static_assert sizeof(mask)==8 regardless
-// of wave width, so the CUDA literal 0xffffffff fails to compile (AutoDock-GPU lesson).
+// of wave width, so the CUDA literal 0xffffffff fails to compile.
 // Keyed on USE_HIP, not on wave width.
 #define OF_SHFL_FULL_MASK 0xffffffffffffffffULL
 
