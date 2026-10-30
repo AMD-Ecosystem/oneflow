@@ -41,6 +41,13 @@ DECLARE_NDARRAY_REDUCE_IMPL(NdarrayMatrixColReduce);
 DECLARE_NDARRAY_REDUCE_IMPL(NdarrayXYZCubeXZReduce);
 #undef DECLARE_NDARRAY_REDUCE_IMPL
 
+#if defined(USE_HIP)
+// hipCUB's device reduce asks for at least 4 bytes of scratch, which is more than
+// elem_cnt * sizeof(T) for a short input of a one-byte type.
+template<typename T, template<typename> class binary_func>
+size_t CudaScalarReduceTmpStorageBytes(int64_t elem_cnt);
+#endif  // defined(USE_HIP)
+
 template<DeviceType device_type, typename T, template<typename> class binary_func,
          typename Enable = void>
 struct NdarrayNoReduce;
