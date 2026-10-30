@@ -19,7 +19,9 @@ limitations under the License.
 #include "oneflow/core/ep/include/primitive/batch_matmul.h"
 #include "oneflow/core/kernel/cuda_graph_support.h"
 #include "oneflow/core/cuda/atomic.cuh"
+#if !defined(USE_HIP)
 #include <mma.h>
+#endif  // !defined(USE_HIP)
 
 namespace oneflow {
 
@@ -1189,12 +1191,15 @@ class FusedDotFeatureInteractionKernel final : public user_op::OpKernel,
     user_op::Tensor* out = ctx->Tensor4ArgNameAndIndex("out", 0);
     const DataType data_type = out->data_type();
     CHECK_LT(out->shape_view().elem_cnt(), GetMaxVal<int32_t>());
+    // The tensor-core kernels use CUDA wmma; the HIP build takes the batched-GEMM path below.
+#if !defined(USE_HIP)
     auto* cuda_stream = ctx->stream()->As<ep::CudaStream>();
     if ((cuda_stream->device_properties().major >= 7 && data_type == DataType::kFloat16)
         || (cuda_stream->device_properties().major >= 8 && data_type == DataType::kFloat)) {
       bool success = TryLaunchTensorCoreDotKernel<T>(ctx);
       if (success == true) { return; }
     }
+#endif  // !defined(USE_HIP)
     CHECK(!ctx->has_input("sparse_feature", 0)) << "sparse_feature is not supported. ";
     user_op::Tensor* tmp_buffer = ctx->Tensor4ArgNameAndIndex("tmp_buffer", 0);
     const int64_t batch_size = out->shape_view().At(0);
@@ -1297,12 +1302,15 @@ class FusedDotFeatureInteractionGradKernel final : public user_op::OpKernel,
     const user_op::Tensor* dy = ctx->Tensor4ArgNameAndIndex("dy", 0);
     user_op::Tensor* tmp_buffer = ctx->Tensor4ArgNameAndIndex("tmp_buffer", 0);
     const DataType data_type = dy->data_type();
+    // The tensor-core kernels use CUDA wmma; the HIP build takes the batched-GEMM path below.
+#if !defined(USE_HIP)
     auto* cuda_stream = ctx->stream()->As<ep::CudaStream>();
     if ((cuda_stream->device_properties().major >= 7 && data_type == DataType::kFloat16)
         || (cuda_stream->device_properties().major >= 8 && data_type == DataType::kFloat)) {
       bool success = TryLaunchTensorCoreDotBackwardKernel<T>(ctx);
       if (success == true) { return; }
     }
+#endif  // !defined(USE_HIP)
     CHECK(!ctx->has_input("sparse_feature", 0)) << "sparse_feature is not supported. ";
     const int64_t batch_size = dy->shape_view().At(0);
     int64_t features_concated_dim = 0;
