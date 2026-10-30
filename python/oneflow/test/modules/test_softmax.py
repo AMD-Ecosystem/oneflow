@@ -50,8 +50,9 @@ def _test_softmax_impl(test_case, shape, input_dtype, output_dtype):
 
 def _test_softmax_wide_rows(test_case, cols, dtype, log):
     np_dtype = _dtype_flow_to_np(dtype)
-    np_x = np.random.randn(cols % 3 + 2, cols).astype(np_dtype)
-    np_dy = np.random.randn(*np_x.shape).astype(np_dtype)
+    rng = np.random.RandomState(cols)
+    np_x = rng.randn(cols % 3 + 2, cols).astype(np_dtype)
+    np_dy = rng.randn(*np_x.shape).astype(np_dtype)
     x = flow.tensor(np_x, device=flow.device("cuda"), requires_grad=True)
     func = flow.nn.functional.log_softmax if log else flow.nn.functional.softmax
     y = func(x, dim=-1)

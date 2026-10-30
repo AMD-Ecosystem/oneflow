@@ -87,11 +87,12 @@ def _test_layer_norm(
     dtype=flow.float32,
     device="cuda",
     backward=True,
+    rng=np.random,
 ):
-    np_x = np.random.randn(*shape).astype(np.float32)
+    np_x = rng.randn(*shape).astype(np.float32)
     if affine:
-        np_weight = np.random.randn(*normalized_shape).astype(np.float32)
-        np_bias = np.random.randn(*normalized_shape).astype(np.float32)
+        np_weight = rng.randn(*normalized_shape).astype(np.float32)
+        np_bias = rng.randn(*normalized_shape).astype(np.float32)
 
     # torch process
     torch_dtype = torch.float16 if dtype is flow.float16 else torch.float32
@@ -111,7 +112,7 @@ def _test_layer_norm(
     )
 
     if backward:
-        np_rand_init_grad = np.random.randn(*tuple(torch_y.shape)).astype(np.float32)
+        np_rand_init_grad = rng.randn(*tuple(torch_y.shape)).astype(np.float32)
         torch_rand_init_grad = torch.tensor(np_rand_init_grad).to(
             device=device, dtype=torch_dtype
         )
@@ -171,17 +172,26 @@ def _test_layer_norm(
             f"\n{a_name} vs. {b_name} max abs diff: {np.max(np.abs(a - b))}",
         )
 
+    # Rounding error grows with each row's 1 / std: y and weight_grad come from
+    # (x - mean) * rstd, and x_grad subtracts terms of size rstd * |dy| that cancel, so it
+    # grows with rstd ** 2. Rows with std >= 1 keep the plain tolerance.
+    norm_axes = tuple(range(len(shape) - len(normalized_shape), len(shape)))
+    var = np.var(np_x.astype(np.float64), axis=norm_axes, keepdims=True)
+    scale = np.maximum(1.0, 1.0 / np.sqrt(var + eps))
+
     if dtype is flow.float16:
-        compare(y, torch_y, "y", "torch_y", 1e-2, 1e-2)
+        compare(y, torch_y, "y", "torch_y", 1e-2 * scale, 1e-2)
         if backward:
-            compare(x_grad, torch_x_grad, "x_grad", "torch_x_grad", 1e-2, 1e-2)
+            compare(
+                x_grad, torch_x_grad, "x_grad", "torch_x_grad", 1e-2 * scale ** 2, 1e-2
+            )
             if affine:
                 compare(
                     weight_grad,
                     torch_weight_grad,
                     "weight_grad",
                     "torch_weight_grad",
-                    1e-2,
+                    1e-2 * scale.max(),
                     1e-2,
                 )
                 compare(
@@ -193,12 +203,16 @@ def _test_layer_norm(
                     1e-2,
                 )
     else:
-        compare(y, torch_y, "y", "torch_y")
+        compare(y, torch_y, "y", "torch_y", 1e-5 * scale)
         if backward:
-            compare(x_grad, torch_x_grad, "x_grad", "torch_x_grad")
+            compare(x_grad, torch_x_grad, "x_grad", "torch_x_grad", 1e-5 * scale ** 2)
             if affine:
                 compare(
-                    weight_grad, torch_weight_grad, "weight_grad", "torch_weight_grad",
+                    weight_grad,
+                    torch_weight_grad,
+                    "weight_grad",
+                    "torch_weight_grad",
+                    1e-5 * scale.max(),
                 )
                 compare(
                     bias_grad, torch_bias_grad, "bias_grad", "torch_bias_grad",
@@ -216,7 +230,10 @@ class TestLayerNorm(flow.unittest.TestCase):
     def test_widths(test_case):
         for cols in _warp_dispatch_widths():
             _test_layer_norm(
-                test_case, shape=[cols % 3 + 2, cols], normalized_shape=[cols]
+                test_case,
+                shape=[cols % 3 + 2, cols],
+                normalized_shape=[cols],
+                rng=np.random.RandomState(cols),
             )
 
     def test_wide_widths(test_case):
@@ -227,6 +244,7 @@ class TestLayerNorm(flow.unittest.TestCase):
                     shape=[cols % 3 + 2, cols],
                     normalized_shape=[cols],
                     dtype=dtype,
+                    rng=np.random.RandomState(cols),
                 )
 
     def test_warp_impl(test_case):
