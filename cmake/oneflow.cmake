@@ -253,14 +253,13 @@ if(USE_HIP)
   #    normalization (MIOpen has a different descriptor/algo-find API);
   #  - the cuBLASLt fused-MLP / grouped-GEMM / matmul-bias family (hipBLASLt API differs:
   #    hipblasLtMatmul descriptor surface and hipblasGemmStridedBatchedEx signature);
-  #  - cuSOLVER lu_decomposition (getrf/getrs; deferred to hipSOLVER);
   #  - the CUTLASS/CuTe + wmma fused kernels (CUTLASS does not port to ROCm; would be a
   #    Composable-Kernel reimplementation) and the TensorRT-flash self-attention kernel;
   #  - the one_embedding P2P/IPC shuffle kernels.
   # Everything else (the ep/cuda/primitive tensor ops and the bulk of user/kernels)
   # compiles as HIP.
   list(FILTER of_all_obj_cc EXCLUDE REGEX
-       "oneflow/user/kernels/(grid_sample_kernel_util|normalization_kernel|grouped_matmul_bias|fused_matmul_bias_add_relu_dropout|fused_matmul_bias_kernel|cublas_fused_mlp_kernel|cublas_fused_mlp_grad_kernel|cublas_bias_add_relu_matmul_grad_kernel|cublas_fused_matmul_bias_add_grad|lu_decomposition_kernel|fused_dot_feature_interaction_kernel|fused_self_attention_query_mul_key_and_value_kernel|fused_attention_kernels|fused_glu_kernel|fused_multi_head_attention_inference_kernel|one_embedding_embedding_shuffle_p2p_kernel|one_embedding_embedding_gradient_shuffle_p2p_kernel)\\.cu$")
+       "oneflow/user/kernels/(grid_sample_kernel_util|normalization_kernel|grouped_matmul_bias|fused_matmul_bias_add_relu_dropout|fused_matmul_bias_kernel|cublas_fused_mlp_kernel|cublas_fused_mlp_grad_kernel|cublas_bias_add_relu_matmul_grad_kernel|cublas_fused_matmul_bias_add_grad|fused_dot_feature_interaction_kernel|fused_self_attention_query_mul_key_and_value_kernel|fused_attention_kernels|fused_glu_kernel|fused_multi_head_attention_inference_kernel|one_embedding_embedding_shuffle_p2p_kernel|one_embedding_embedding_gradient_shuffle_p2p_kernel)\\.cu$")
   # cuDNN host TUs: the conv / deconv / TF-pooling kernels and the cuDNN descriptor/conv
   # utilities call cuDNN ops with no MIOpen drop-in (different descriptor/algo-find API),
   # so they are deferred like the cuDNN .cu kernels above. Their ops remain registered

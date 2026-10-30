@@ -98,7 +98,7 @@ const char* CuFFTGetErrorString(cufftResult_t error) {
   }
 }
 
-#if CUDA_VERSION >= 11000 && !defined(USE_HIP)
+#if CUDA_VERSION >= 11000
 const char* CusovlerGetErrorString(cusolverStatus_t error) {
   switch (error) {
     case CUSOLVER_STATUS_SUCCESS: return "CUSOLVER_STATUS_SUCCESS";

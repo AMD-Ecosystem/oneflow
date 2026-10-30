@@ -20,6 +20,7 @@ if(BUILD_CUDA AND USE_HIP)
   find_package(hipcub REQUIRED)
   find_package(rocthrust REQUIRED)
   find_package(rccl REQUIRED) # NCCL -> RCCL; the collective-comm backend links it
+  find_package(hipsolver REQUIRED)
 
   # Link hip::host (the HIP runtime) but NOT hip::device: hip::device carries an
   # INTERFACE_COMPILE_OPTIONS of `-x hip --offload-arch=<arch>` gated on
@@ -34,10 +35,11 @@ if(BUILD_CUDA AND USE_HIP)
   # RCCL satisfies the nccl* symbols the collective-comm GPU backend references (the compat
   # header maps <nccl.h> to <rccl/rccl.h>); roc::rccl pulls only hip::host, no hip::device.
   list(APPEND VENDOR_CUDA_LIBRARIES roc::rccl)
-  # hipblaslt/hipsolver back only the deferred fused-MLP / cuSOLVER kernels (excluded from
-  # the HIP glob), and roc::hipblaslt re-propagates hip::device's -x hip onto the host
-  # .cpp; do not link them into the monolith. Their handle TYPES still resolve via the
-  # __clang__-gated headers in cuda_to_hip.h on the HIP-language TUs that include them.
+  list(APPEND VENDOR_CUDA_LIBRARIES roc::hipsolver)
+  # hipblaslt backs only the deferred fused-MLP kernels (excluded from the HIP glob), and
+  # roc::hipblaslt re-propagates hip::device's -x hip onto the host .cpp; do not link it into
+  # the monolith. Its handle TYPE still resolves via the __clang__-gated header in
+  # cuda_to_hip.h on the HIP-language TUs that include it.
   message(STATUS "VENDOR_CUDA_LIBRARIES (HIP): ${VENDOR_CUDA_LIBRARIES}")
 
   set(CUDA_VERSION "0.0" CACHE STRING "" FORCE) # unused on HIP; satisfies version guards

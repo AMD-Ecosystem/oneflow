@@ -21,16 +21,10 @@ limitations under the License.
 #ifdef WITH_CUDA
 
 #include <cublas_v2.h>
-#if !defined(USE_HIP)
-// cuSOLVER/cuDNN/nvjpeg are deferred on ROCm (cuSOLVER is used only by excluded kernels;
-// MIOpen is not a cuDNN drop-in; nvjpeg/npp image decode is NVIDIA-only). The TUs that use them
-// are excluded from the HIP monolith glob (see cmake/oneflow.cmake), so their error-string
-// helpers and the headers below are gated out under USE_HIP.
 #if CUDA_VERSION >= 11000
 #include <cusolverDn.h>
 #endif
 #include <cuda.h>
-#endif  // !USE_HIP
 #if CUDA_VERSION >= 10010 || defined(USE_HIP)
 #include <cublasLt.h>
 #endif
@@ -62,7 +56,7 @@ const char* CurandGetErrorString(curandStatus_t error);
 
 const char* CuFFTGetErrorString(cufftResult_t error);
 
-#if CUDA_VERSION >= 11000 && !defined(USE_HIP)
+#if CUDA_VERSION >= 11000
 const char* CusovlerGetErrorString(cusolverStatus_t error);
 #endif
 

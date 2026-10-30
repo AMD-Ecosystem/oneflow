@@ -168,10 +168,10 @@ CudaStream::CudaStream(CudaDevice* device)
   OF_CUBLAS_CHECK(cublasCreate(&cublas_handle_));
   OF_CUBLAS_CHECK(cublasSetStream(cublas_handle_, cuda_stream_));
   if (need_check_version) { CheckCublasVersion(cublas_handle_); }
-  // On ROCm the cublasLt (fused-MLP / grouped-GEMM), cuSOLVER (lu_decomposition), and
-  // cuDNN (conv / normalization) handles back only the deferred kernels, whose TUs are
-  // excluded from the HIP build; their hip* libraries are not linked, so skip creating
-  // those handles here. The plain cublas (hipblas) handle drives the matmul primitive.
+  // On ROCm the cublasLt (fused-MLP / grouped-GEMM) and cuDNN (conv / normalization) handles
+  // back only the deferred kernels, whose TUs are excluded from the HIP build; their hip*
+  // libraries are not linked, so skip creating those handles here. The plain cublas (hipblas)
+  // handle drives the matmul primitive.
 #if !defined(USE_HIP)
 #if CUDA_VERSION >= 10010
   // cublas_lt_handle
@@ -183,13 +183,11 @@ CudaStream::CudaStream(CudaDevice* device)
     OF_CUBLAS_CHECK(cublasSetMathMode(cublas_handle_, CUBLAS_TF32_TENSOR_OP_MATH));
   }
 #endif  // CUBLAS_VERSION >= 11000
-#if !defined(USE_HIP)
   // cusolver_dn_handle
 #if CUDA_VERSION >= 11000
   OF_CUSOLVER_CHECK(cusolverDnCreate(&cusolver_dn_handle_));
   OF_CUSOLVER_CHECK(cusolverDnSetStream(cusolver_dn_handle_, cuda_stream_));
 #endif
-#endif  // !USE_HIP
   workspace_size_ =
       ParseIntegerFromEnv("ONEFLOW_EP_CUDA_CUBLAS_WORKSPACE_SIZE_MB", kDefaultWorkspaceSizeMb)
       * 1024 * 1024;
@@ -212,10 +210,10 @@ CudaStream::~CudaStream() {
   OF_CUDNN_CHECK(cudnnDestroy(cudnn_handle_));
 #endif  // !USE_HIP
   OF_CUBLAS_CHECK(cublasDestroy(cublas_handle_));
-#if !defined(USE_HIP)
 #if CUDA_VERSION >= 11000
   OF_CUSOLVER_CHECK(cusolverDnDestroy(cusolver_dn_handle_));
 #endif
+#if !defined(USE_HIP)
 #if CUDA_VERSION >= 10010
   OF_CUBLAS_CHECK(cublasLtDestroy(cublas_lt_handle_));
 #endif

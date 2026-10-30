@@ -456,11 +456,23 @@ __device__ __forceinline__ __hip_bfloat162 __float2bfloat162_rn(float v) {
 #define CUDNN_BN_MIN_EPSILON 0.0
 #endif
 
-// ---- cuSOLVER (handle/stream only; the dense ops are deferred) ------------------
+// ---- cuSOLVER (hipSOLVER's Dn compatibility API has the same signatures) ----------
 #define cusolverStatus_t hipsolverStatus_t
 #define cusolverDnCreate hipsolverDnCreate
 #define cusolverDnDestroy hipsolverDnDestroy
 #define cusolverDnSetStream hipsolverDnSetStream
+#define cusolverDnSgetrf_bufferSize hipsolverDnSgetrf_bufferSize
+#define cusolverDnDgetrf_bufferSize hipsolverDnDgetrf_bufferSize
+#define cusolverDnSgetrf hipsolverDnSgetrf
+#define cusolverDnDgetrf hipsolverDnDgetrf
+#define CUSOLVER_STATUS_SUCCESS HIPSOLVER_STATUS_SUCCESS
+#define CUSOLVER_STATUS_NOT_INITIALIZED HIPSOLVER_STATUS_NOT_INITIALIZED
+#define CUSOLVER_STATUS_ALLOC_FAILED HIPSOLVER_STATUS_ALLOC_FAILED
+#define CUSOLVER_STATUS_INVALID_VALUE HIPSOLVER_STATUS_INVALID_VALUE
+#define CUSOLVER_STATUS_ARCH_MISMATCH HIPSOLVER_STATUS_ARCH_MISMATCH
+#define CUSOLVER_STATUS_EXECUTION_FAILED HIPSOLVER_STATUS_EXECUTION_FAILED
+#define CUSOLVER_STATUS_INTERNAL_ERROR HIPSOLVER_STATUS_INTERNAL_ERROR
+#define CUSOLVER_STATUS_MATRIX_TYPE_NOT_SUPPORTED HIPSOLVER_STATUS_MATRIX_TYPE_NOT_SUPPORTED
 
 #endif  // USE_HIP
 
