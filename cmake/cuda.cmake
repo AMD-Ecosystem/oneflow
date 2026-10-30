@@ -23,6 +23,8 @@ if(BUILD_CUDA AND USE_HIP)
   find_package(hipsolver REQUIRED)
   find_package(miopen REQUIRED) # cuDNN -> MIOpen, through the cudnn.h shim header
   find_package(hipblaslt REQUIRED) # cuBLASLt -> hipBLASLt, through the cublasLt.h shim header
+  find_package(rocjpeg REQUIRED) # nvJPEG -> rocJPEG (GPU image decoder)
+  find_package(rpp REQUIRED) # NPP -> RPP (resize after the GPU image decoder)
 
   # Link hip::host (the HIP runtime) but NOT hip::device: hip::device carries an
   # INTERFACE_COMPILE_OPTIONS of `-x hip --offload-arch=<arch>` gated on
@@ -37,6 +39,7 @@ if(BUILD_CUDA AND USE_HIP)
   # header maps <nccl.h> to <rccl/rccl.h>); roc::rccl pulls only hip::host, no hip::device.
   list(APPEND VENDOR_CUDA_LIBRARIES roc::rccl)
   list(APPEND VENDOR_CUDA_LIBRARIES roc::hipsolver MIOpen roc::hipblaslt)
+  list(APPEND VENDOR_CUDA_LIBRARIES rocjpeg::rocjpeg rpp::rpp)
   message(STATUS "VENDOR_CUDA_LIBRARIES (HIP): ${VENDOR_CUDA_LIBRARIES}")
 
   set(CUDA_VERSION "0.0" CACHE STRING "" FORCE) # unused on HIP; satisfies version guards
