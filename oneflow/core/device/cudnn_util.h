@@ -19,11 +19,7 @@ limitations under the License.
 #include "oneflow/core/common/data_type.h"
 #include "oneflow/core/common/shape_view.h"
 
-// cuDNN -> MIOpen is deferred (MIOpen is not a cuDNN drop-in). Skip the cuDNN-dependent
-// body under USE_HIP; the 78 kernels that include this header transitively do not all
-// call cuDNN, and the genuine conv/pool/batchnorm cuDNN ops are excluded from the HIP
-// monolith glob (cmake/oneflow.cmake) until a MIOpen adaptation lands.
-#if defined(WITH_CUDA) && !defined(USE_HIP)
+#ifdef WITH_CUDA
 
 #include "cudnn.h"
 

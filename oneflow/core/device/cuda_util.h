@@ -29,9 +29,7 @@ limitations under the License.
 #include <cublasLt.h>
 #endif
 #include <cuda_runtime.h>
-#if !defined(USE_HIP)
 #include <cudnn.h>
-#endif
 #include <curand.h>
 #include <cufft.h>
 #include <nccl.h>

@@ -193,12 +193,8 @@ Maybe<void> EnvGlobalObjectsScope::Init(const EnvProto& env_proto) {
   Singleton<ThreadPool>::New(Singleton<ResourceDesc, ForSession>::Get()->ComputeThreadPoolSize());
   SetCpuDeviceManagerNumThreads();
 #ifdef WITH_CUDA
-  // The cuDNN conv-algo cache / handle pool back the deferred cuDNN conv path (no MIOpen
-  // drop-in); their types live in cudnn_conv_util.h, which is gated out under USE_HIP.
-#if !defined(USE_HIP)
   Singleton<CudnnConvAlgoCache>::New();
   Singleton<CudnnHandlePool>::New();
-#endif  // !USE_HIP
   Singleton<embedding::EmbeddingManager>::New();
 #endif
   const auto& vaild_ccl_comm_mgr_device_types =
@@ -255,10 +251,8 @@ EnvGlobalObjectsScope::~EnvGlobalObjectsScope() {
   Singleton<vm::VirtualMachineScope>::Delete();
 #ifdef WITH_CUDA
   Singleton<embedding::EmbeddingManager>::Delete();
-#if !defined(USE_HIP)
   Singleton<CudnnConvAlgoCache>::Delete();
   Singleton<CudnnHandlePool>::Delete();
-#endif  // !USE_HIP
 #endif
   if (Singleton<EagerCclCommMgr>::Get() != nullptr) { Singleton<EagerCclCommMgr>::Delete(); }
   Singleton<ThreadPool>::Delete();

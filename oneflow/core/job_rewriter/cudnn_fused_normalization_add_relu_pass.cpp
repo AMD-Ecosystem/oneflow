@@ -16,16 +16,16 @@ limitations under the License.
 #include "oneflow/core/job_rewriter/job_pass.h"
 #include "oneflow/core/framework/framework.h"
 
-#if defined(WITH_CUDA) && !defined(USE_HIP)
+#ifdef WITH_CUDA
 #include <cudnn.h>
-#endif  // WITH_CUDA && !USE_HIP
+#endif  // WITH_CUDA
 
 namespace oneflow {
 
 namespace {
 
 bool IsFusedBnAddReluSupported() {
-#if defined(WITH_CUDA) && (CUDNN_VERSION >= 7401)
+#if defined(WITH_CUDA) && (CUDNN_VERSION >= 7401) && !defined(USE_HIP)
   return true;
 #else
   return false;
