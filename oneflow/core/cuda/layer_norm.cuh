@@ -37,6 +37,15 @@ constexpr int kWarpSize = OF_GPU_WARP_SIZE;
 constexpr int kWarpSize = 32;
 #endif
 
+// The (max_cols, min_cols) dispatch rungs below read min_cols * kWarpSize columns
+// unconditionally, so every width up to one full warp must be taken by a thread-group rung
+// first. On a 64-wide wavefront that needs a 64-wide rung, which a 32-lane warp cannot have.
+#if defined(OF_GPU_WARP_SIZE) && OF_GPU_WARP_SIZE == 64
+#define OF_NORM_WARP_64 1
+#else
+#define OF_NORM_WARP_64 0
+#endif
+
 #ifndef OF_SHFL_FULL_MASK
 #define OF_SHFL_FULL_MASK 0xffffffff
 #endif
@@ -494,6 +503,9 @@ typename std::enable_if<pack_size == 1, cudaError_t>::type DispatchLayerNormWarp
   DEFINE_ONE_ELIF(8)
   DEFINE_ONE_ELIF(16)
   DEFINE_ONE_ELIF(32)
+#if OF_NORM_WARP_64
+  DEFINE_ONE_ELIF(64)
+#endif
 #undef DEFINE_ONE_ELIF
 #define DEFINE_ONE_ELIF(max_col, min_col)                                                          \
   else if (cols <= (max_col)*kWarpSize) {                                                          \
@@ -537,6 +549,9 @@ typename std::enable_if<pack_size == 2, cudaError_t>::type DispatchLayerNormWarp
   DEFINE_ONE_ELIF(8)
   DEFINE_ONE_ELIF(16)
   DEFINE_ONE_ELIF(32)
+#if OF_NORM_WARP_64
+  DEFINE_ONE_ELIF(64)
+#endif
 #undef DEFINE_ONE_ELIF
 #define DEFINE_ONE_ELIF(max_col, min_col)                                                          \
   else if ((cols <= (max_col)*kWarpSize) && (cols > (min_col)*kWarpSize)) {                        \
@@ -1133,6 +1148,9 @@ typename std::enable_if<pack_size == 1, cudaError_t>::type DispatchLayerNormGrad
   DEFINE_ONE_ELIF(8)
   DEFINE_ONE_ELIF(16)
   DEFINE_ONE_ELIF(32)
+#if OF_NORM_WARP_64
+  DEFINE_ONE_ELIF(64)
+#endif
 #undef DEFINE_ONE_ELIF
 #define DEFINE_ONE_ELIF(max_col, min_col)                                                   \
   else if (cols <= (max_col)*kWarpSize) {                                                   \

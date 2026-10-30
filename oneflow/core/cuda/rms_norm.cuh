@@ -33,6 +33,15 @@ constexpr int kWarpSize = OF_GPU_WARP_SIZE;
 constexpr int kWarpSize = 32;
 #endif
 
+// The (max_cols, min_cols) dispatch rungs below read min_cols * kWarpSize columns
+// unconditionally, so every width up to one full warp must be taken by a thread-group rung
+// first. On a 64-wide wavefront that needs a 64-wide rung, which a 32-lane warp cannot have.
+#if defined(OF_GPU_WARP_SIZE) && OF_GPU_WARP_SIZE == 64
+#define OF_NORM_WARP_64 1
+#else
+#define OF_NORM_WARP_64 0
+#endif
+
 #ifndef OF_SHFL_FULL_MASK
 #define OF_SHFL_FULL_MASK 0xffffffff
 #endif
@@ -64,7 +73,8 @@ __global__ void RmsNormWarpImpl(LOAD load, STORE store, const int nrow, const in
   ComputeType buf[rows_per_access][max_cols_per_thread];
   const int global_thread_group_id = blockIdx.x * blockDim.y + threadIdx.y;
   const int num_global_thread_groups = gridDim.x * blockDim.y;
-  for (int row_i = global_thread_group_id; row_i < nrow; row_i += num_global_thread_groups) {
+  for (int row_i = global_thread_group_id; row_i < nrow / rows_per_access;
+       row_i += num_global_thread_groups) {
     ComputeType thread_square_sum[rows_per_access];
 #pragma unroll
     for (int row_j = 0; row_j < rows_per_access; ++row_j) {
@@ -197,6 +207,9 @@ typename std::enable_if<pack_size == 1, cudaError_t>::type DispatchLaunchRmsNorm
   DEFINE_ONE_ELIF(8)
   DEFINE_ONE_ELIF(16)
   DEFINE_ONE_ELIF(32)
+#if OF_NORM_WARP_64
+  DEFINE_ONE_ELIF(64)
+#endif
 #undef DEFINE_ONE_ELIF
 #define DEFINE_ONE_ELIF(max_col, min_col)                                                         \
   else if (ncol <= (max_col)*kWarpSize) {                                                         \
@@ -240,6 +253,9 @@ typename std::enable_if<pack_size == 2, cudaError_t>::type DispatchLaunchRmsNorm
   DEFINE_ONE_ELIF(8)
   DEFINE_ONE_ELIF(16)
   DEFINE_ONE_ELIF(32)
+#if OF_NORM_WARP_64
+  DEFINE_ONE_ELIF(64)
+#endif
 #undef DEFINE_ONE_ELIF
 #define DEFINE_ONE_ELIF(max_col, min_col)                                                         \
   else if ((ncol <= (max_col)*kWarpSize) && (ncol > (min_col)*kWarpSize)) {                       \
@@ -535,7 +551,8 @@ __global__ void RmsNormGradWarpImpl(const int nrow, const int ncol, LOAD_X load_
 
   const int global_thread_group_id = blockIdx.x * blockDim.y + threadIdx.y;
   const int num_global_thread_group = gridDim.x * blockDim.y;
-  for (int row_i = global_thread_group_id; row_i < nrow; row_i += num_global_thread_group) {
+  for (int row_i = global_thread_group_id; row_i < nrow / rows_per_access;
+       row_i += num_global_thread_group) {
     ComputeType sum_stats[rows_per_access];
     ComputeType inv_rms_buf[rows_per_access];
 #pragma unroll
@@ -666,6 +683,9 @@ typename std::enable_if<pack_size == 1, cudaError_t>::type DispatchLaunchRmsNorm
   DEFINE_ONE_ELIF(8)
   DEFINE_ONE_ELIF(16)
   DEFINE_ONE_ELIF(32)
+#if OF_NORM_WARP_64
+  DEFINE_ONE_ELIF(64)
+#endif
 #undef DEFINE_ONE_ELIF
 #define DEFINE_ONE_ELIF(max_col, min_col)                                                        \
   else if (ncol <= (max_col)*kWarpSize) {                                                        \

@@ -45,6 +45,17 @@ def _layer_norm(x, normalized_shape, weight=None, bias=None, eps=1e-6):
         )
 
 
+def _warp_dispatch_widths():
+    # Every width up to 256, then both sides of each multiple of 32 up to 2048 and a few
+    # wider ones, so that each column bucket of the warp and block kernels is reached on
+    # 32- and 64-wide warps, for both pack sizes.
+    widths = list(range(1, 257))
+    for k in range(9, 65):
+        widths += [32 * k - 1, 32 * k, 32 * k + 1]
+    widths += [3071, 4095, 4096, 4097, 8191, 8192]
+    return widths
+
+
 def _test_layer_norm(
     test_case,
     shape,
@@ -179,6 +190,12 @@ class TestLayerNorm(flow.unittest.TestCase):
         _test_layer_norm(
             test_case, shape=[4, 16], normalized_shape=[16], affine=False,
         )
+
+    def test_widths(test_case):
+        for cols in _warp_dispatch_widths():
+            _test_layer_norm(
+                test_case, shape=[cols % 3 + 2, cols], normalized_shape=[cols]
+            )
 
     def test_warp_impl(test_case):
         _test_layer_norm(
