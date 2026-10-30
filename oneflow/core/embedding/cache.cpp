@@ -27,14 +27,7 @@ std::unique_ptr<Cache> NewCache(const CacheOptions& options) {
   CHECK_GT(options.value_size, 0);
   CHECK_GT(options.capacity, 0);
   if (options.policy == CacheOptions::Policy::kLRU) {
-#if !defined(USE_HIP)
     return NewLruCache(options);
-#else
-    // The LRU cache kernel (lru_cache.cu) uses cuda::std::semaphore, which has no ROCm
-    // equivalent, so it is excluded from the HIP build; the full cache policy still works.
-    UNIMPLEMENTED() << "the LRU embedding cache is not supported on ROCm; use the full cache";
-    return nullptr;
-#endif  // !USE_HIP
   } else if (options.policy == CacheOptions::Policy::kFull) {
     return NewFullCache(options);
   } else {

@@ -23,7 +23,7 @@ limitations under the License.
 #include <cuda.h>
 
 #if CUDA_VERSION >= 11000 && ((!defined(__CUDA_ARCH__)) || (__CUDA_ARCH__ >= 700)) \
-    && !(defined(__clang__) && defined(__CUDA__))
+    && !(defined(__clang__) && defined(__CUDA__)) && !defined(USE_HIP)
 #include <cuda/std/semaphore>
 #endif
 
@@ -33,13 +33,10 @@ namespace embedding {
 
 namespace {
 
-// This LRU cache maps one set of 32 ways onto one warp (one way per lane), so kWarpSize
-// stays 32 here: on a 64-lane CDNA wavefront lanes 32-63 are simply inactive (their ballot
-// bits are 0), which keeps the 32-way design correct without a redesign. HIP's
-// __ballot/__shfl_sync require a 64-bit mask (ROCm 7.x static_assert), so the mask is
-// 64-bit and the ballot results are folded with the 64-bit __ffsll/__popcll via the
-// helpers below; the low 32 bits carry the active ways.
-constexpr int kWarpSize = 32;
+// One set has one way per lane of a warp, so the number of ways follows the hardware warp
+// width (64 on wavefront-64 GPUs). HIP ballots are 64-bit, so the mask and the bit helpers are
+// 64-bit there.
+constexpr int kWarpSize = kCudaWarpSize;
 constexpr int kNumWarpPerBlock = 4;
 constexpr int kBlockSize = kNumWarpPerBlock * kWarpSize;
 #if defined(USE_HIP)
@@ -102,7 +99,7 @@ class WarpMutexAtomicImpl {
 };
 
 #if CUDA_VERSION >= 11000 && ((!defined(__CUDA_ARCH__)) || (__CUDA_ARCH__ >= 700)) \
-    && !(defined(__clang__) && defined(__CUDA__))
+    && !(defined(__clang__) && defined(__CUDA__)) && !defined(USE_HIP)
 
 class WarpMutexSemaphoreImpl {
  public:
@@ -166,7 +163,7 @@ void InitLruCacheContext(const CacheOptions& options, LruCacheContext<Key, Elem>
   int major = 0;
   OF_CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
   size_t mutex_size_per_set = 0;
-#if CUDA_VERSION >= 11000 && !(defined(__clang__) && defined(__CUDA__))
+#if CUDA_VERSION >= 11000 && !(defined(__clang__) && defined(__CUDA__)) && !defined(USE_HIP)
   if (major >= 7) {
 #if !defined(__CUDA_ARCH__)
     mutex_size_per_set = sizeof(WarpMutexSemaphoreImpl);
@@ -272,7 +269,6 @@ struct SetContext {
       __syncwarp();
     }
     if (insert_way == -1) {
-      // Active ways occupy the low kWarpSize bits of the (possibly 64-wide) ballot.
       const auto valid_mask = __ballot_sync(kFullMask, lane_age != 0);
       if (OfWarpPopc(valid_mask) != kWarpSize) {
         insert_way = OfWarpPopc(valid_mask);
