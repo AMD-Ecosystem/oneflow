@@ -229,7 +229,36 @@ limitations under the License.
 #define cudaFuncSetAttribute hipFuncSetAttribute
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #define cudaLaunchKernel hipLaunchKernel
-#define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
+#define cudaOccupancyMaxActiveBlocksPerMultiprocessor OfHipOccupancyMaxActiveBlocksPerMultiprocessor
+
+// The shared-memory softmax and normalization kernels are chosen whenever the occupancy query
+// reports at least one resident block, which on CUDA means the block fits. On RDNA the HIP query
+// measures dynamic shared memory against the whole workgroup processor (128 KiB on gfx11) rather
+// than the per-block limit (64 KiB), so it reports a block that then fails to launch or aborts
+// the queue. Report zero blocks when dynamic plus static shared memory exceeds the device's
+// per-block limit, as CUDA does.
+template<typename F>
+inline hipError_t OfHipOccupancyMaxActiveBlocksPerMultiprocessor(int* num_blocks, F func,
+                                                                 int block_size,
+                                                                 size_t dynamic_smem_size) {
+  const void* func_ptr = reinterpret_cast<const void*>(func);
+  hipError_t err = hipOccupancyMaxActiveBlocksPerMultiprocessor(num_blocks, func_ptr, block_size,
+                                                                dynamic_smem_size);
+  if (err != hipSuccess || *num_blocks <= 0 || dynamic_smem_size == 0) { return err; }
+  int dev = 0;
+  err = hipGetDevice(&dev);
+  if (err != hipSuccess) { return err; }
+  int max_smem_per_block = 0;
+  err = hipDeviceGetAttribute(&max_smem_per_block, hipDeviceAttributeMaxSharedMemoryPerBlock, dev);
+  if (err != hipSuccess) { return err; }
+  hipFuncAttributes attr{};
+  err = hipFuncGetAttributes(&attr, func_ptr);
+  if (err != hipSuccess) { return err; }
+  if (dynamic_smem_size + attr.sharedSizeBytes > static_cast<size_t>(max_smem_per_block)) {
+    *num_blocks = 0;
+  }
+  return hipSuccess;
+}
 
 #define cudaGraph_t hipGraph_t
 #define cudaGraphExec_t hipGraphExec_t

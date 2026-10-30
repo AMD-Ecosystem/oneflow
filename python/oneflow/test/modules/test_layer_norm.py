@@ -56,6 +56,28 @@ def _warp_dispatch_widths():
     return widths
 
 
+def _wide_widths():
+    # Widths past 8192 on both sides of the row sizes at which a cached row needs 64 KiB and
+    # 128 KiB of shared memory, forward and backward, in fp32 and fp16, so that the dispatch
+    # from the shared-memory kernels to the uncached ones is reached.
+    return [
+        8180,
+        8190,
+        12000,
+        16000,
+        16350,
+        16384,
+        16400,
+        24000,
+        32000,
+        32760,
+        32768,
+        32800,
+        40000,
+        65000,
+    ]
+
+
 def _test_layer_norm(
     test_case,
     shape,
@@ -196,6 +218,16 @@ class TestLayerNorm(flow.unittest.TestCase):
             _test_layer_norm(
                 test_case, shape=[cols % 3 + 2, cols], normalized_shape=[cols]
             )
+
+    def test_wide_widths(test_case):
+        for dtype in [flow.float32, flow.float16]:
+            for cols in _wide_widths():
+                _test_layer_norm(
+                    test_case,
+                    shape=[cols % 3 + 2, cols],
+                    normalized_shape=[cols],
+                    dtype=dtype,
+                )
 
     def test_warp_impl(test_case):
         _test_layer_norm(
