@@ -50,15 +50,15 @@ void NameThisHostThread(const std::string& name) {
 }
 
 void RangePush(const std::string& name) {
-#ifdef OF_ENABLE_PROFILER
+#if defined(OF_ENABLE_PROFILER) && !defined(USE_HIP)
   nvtxRangePushA(name.c_str());
-#endif  // OF_ENABLE_PROFILER
+#endif  // OF_ENABLE_PROFILER && !USE_HIP
 }
 
 void RangePop() {
-#ifdef OF_ENABLE_PROFILER
+#if defined(OF_ENABLE_PROFILER) && !defined(USE_HIP)
   nvtxRangePop();
-#endif  // OF_ENABLE_PROFILER
+#endif  // OF_ENABLE_PROFILER && !USE_HIP
 }
 
 RangeGuard::RangeGuard(const std::string& name) {

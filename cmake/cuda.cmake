@@ -46,13 +46,29 @@ if(BUILD_CUDA AND USE_HIP)
   # each .cu (the warp-tiled reductions in core/cuda/{softmax,layer_norm,rms_norm}.cuh
   # use it as a kernel template arg, so it must be one compile-time constant; __GFX9__
   # is set only in the device pass and cannot be used). CDNA (gfx9xx) is 64; RDNA
-  # (gfx10xx/gfx11xx) is 32. Other GPUs change only -DCMAKE_HIP_ARCHITECTURES.
-  set(_of_warp 32)
+  # (gfx10xx/gfx11xx) is 32. Other GPUs change only -DCMAKE_HIP_ARCHITECTURES. A build
+  # can carry only one width, so an arch list mixing the two families is refused.
+  set(_of_wave64_archs)
+  set(_of_wave32_archs)
   foreach(_of_arch ${CMAKE_HIP_ARCHITECTURES})
     if("${_of_arch}" MATCHES "^gfx9")
-      set(_of_warp 64)
+      list(APPEND _of_wave64_archs ${_of_arch})
+    else()
+      list(APPEND _of_wave32_archs ${_of_arch})
     endif()
   endforeach()
+  if(_of_wave64_archs AND _of_wave32_archs)
+    message(
+      FATAL_ERROR
+        "CMAKE_HIP_ARCHITECTURES mixes wavefront-64 (${_of_wave64_archs}) and wavefront-32 "
+        "(${_of_wave32_archs}) GPUs. The warp size is a compile-time constant shared by "
+        "every code object, so build for one family at a time.")
+  endif()
+  if(_of_wave64_archs)
+    set(_of_warp 64)
+  else()
+    set(_of_warp 32)
+  endif()
   set(OF_GPU_WARP_SIZE ${_of_warp} CACHE INTERNAL "wavefront width for the HIP target arch")
   message(STATUS "OF_GPU_WARP_SIZE: ${OF_GPU_WARP_SIZE}")
 
@@ -67,7 +83,7 @@ if(BUILD_CUDA AND USE_HIP)
 
   # The GPU host .cpp TUs (ep/cuda/*.cpp, device/cuda_util.cpp, ...) call cuda*/cublas*
   # and include <cuda.h>/<cuda_runtime.h> too, but are compiled by the CXX compiler, not
-  # hipcc. They are given the compat aliases, the shim dir, /opt/rocm/include, and the
+  # hipcc. They are given the compat aliases, the shim dir, hip_INCLUDE_DIRS, and the
   # warp-size macro per-target by set_compile_options_to_oneflow_target (NOT globally --
   # a global force-include leaks into the third-party subdir builds, e.g. TBB).
 elseif(BUILD_CUDA)

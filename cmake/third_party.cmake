@@ -129,17 +129,11 @@ endif()
 list(APPEND ONEFLOW_THIRD_PARTY_INCLUDE_DIRS ${RE2_INCLUDE_DIR})
 
 if(BUILD_CUDA AND USE_HIP)
-  # ROCm/HIP backend: hipCUB/rocThrust are header drop-ins on /opt/rocm/include (cub::
+  # ROCm/HIP backend: hipCUB/rocThrust are header drop-ins in the ROCm include dir (cub::
   # is aliased to hipcub:: in the cub shim header), RCCL provides the nccl.h-compatible
-  # API, and MIOpen/CUTLASS/flash-attention are deferred (not in the first slice).
+  # API, and MIOpen/CUTLASS/flash-attention are not ported yet.
   # VENDOR_CUDA_LIBRARIES holds the hip:: imported targets built in cmake/cuda.cmake.
   list(APPEND oneflow_third_party_libs ${VENDOR_CUDA_LIBRARIES})
-  if(WITH_RCCL)
-    find_package(rccl QUIET)
-    if(rccl_FOUND)
-      list(APPEND oneflow_third_party_libs roc::rccl)
-    endif()
-  endif()
 elseif(BUILD_CUDA)
   # Always use third_party/cub for Clang CUDA in case of compatibility issues
   if("${CMAKE_CUDA_COMPILER_ID}" STREQUAL "NVIDIA" AND CUDA_VERSION VERSION_GREATER_EQUAL "11.0")

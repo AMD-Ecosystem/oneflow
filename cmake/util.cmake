@@ -243,12 +243,12 @@ function(set_compile_options_to_oneflow_target target)
     target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-Werror=return-type>)
     # oneflow's own GPU host .cpp TUs (ep/cuda/*.cpp, device/cuda_util.cpp, ...) call
     # cuda*/cublas* and include <cuda.h> etc. but compile as CXX (not hipcc), so they need
-    # the compat header force-included, the toolkit-name shim dir, /opt/rocm/include, and
+    # the compat header force-included, the toolkit-name shim dir, the ROCm include dir, and
     # the warp-size macro -- applied per oneflow target (not globally, to avoid leaking
     # into third-party subdir builds like TBB). -Wno-attributes silences the benign HIP
     # device-decl 'convergent' warnings the host g++ emits.
     target_include_directories(${target} PRIVATE "${PROJECT_SOURCE_DIR}/oneflow/core/device/hip_compat"
-                               /opt/rocm/include)
+                               ${hip_INCLUDE_DIRS})
     target_compile_definitions(${target} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:OF_GPU_WARP_SIZE=${OF_GPU_WARP_SIZE}>)
     target_compile_options(${target} PRIVATE
       $<$<COMPILE_LANGUAGE:CXX>:-include${PROJECT_SOURCE_DIR}/oneflow/core/device/cuda_to_hip.h>
