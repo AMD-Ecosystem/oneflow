@@ -52,6 +52,17 @@ constexpr int kWarpSize = 32;
 #define OF_SHFL_FULL_MASK 0xffffffff
 #endif
 
+// The block kernels below may launch with up to 1024 threads. On HIP that bound is stated
+// explicitly so the register allocation always permits such a launch; the CUDA kernels keep
+// upstream's attributes.
+#ifndef OF_HIP_BLOCK_LAUNCH_BOUNDS
+#if defined(USE_HIP)
+#define OF_HIP_BLOCK_LAUNCH_BOUNDS __launch_bounds__(1024)
+#else
+#define OF_HIP_BLOCK_LAUNCH_BOUNDS
+#endif
+#endif
+
 template<typename T>
 struct SumOp {
   __device__ __forceinline__ T operator()(const T& a, const T& b) const { return a + b; }
@@ -497,7 +508,7 @@ inline cudaError_t DispatchSoftmaxWarpImpl(cudaStream_t stream, LOAD load, STORE
 
 template<typename LOAD, typename STORE, typename ComputeType, int pack_size, int block_size,
          Algorithm algorithm>
-__global__ void __launch_bounds__(1024)
+__global__ void OF_HIP_BLOCK_LAUNCH_BOUNDS
     SoftmaxBlockSMemImpl(LOAD load, STORE store, const int64_t rows, const int64_t cols) {
   extern __shared__ __align__(sizeof(double)) unsigned char shared_buf[];
   auto* buf = reinterpret_cast<ComputeType*>(shared_buf);
@@ -650,7 +661,7 @@ inline cudaError_t TryDispatchSoftmaxBlockSMemImpl(cudaStream_t stream, LOAD loa
 
 template<typename LOAD, typename STORE, typename ComputeType, int pack_size, int block_size,
          Algorithm algorithm>
-__global__ void __launch_bounds__(1024)
+__global__ void OF_HIP_BLOCK_LAUNCH_BOUNDS
     SoftmaxBlockUncachedImpl(LOAD load, STORE store, const int64_t rows, const int64_t cols) {
   const int tid = threadIdx.x;
   assert(cols % pack_size == 0);

@@ -41,6 +41,17 @@ constexpr int kWarpSize = 32;
 #define OF_SHFL_FULL_MASK 0xffffffff
 #endif
 
+// The block kernels below may launch with up to 1024 threads. On HIP that bound is stated
+// explicitly so the register allocation always permits such a launch; the CUDA kernels keep
+// upstream's attributes.
+#ifndef OF_HIP_BLOCK_LAUNCH_BOUNDS
+#if defined(USE_HIP)
+#define OF_HIP_BLOCK_LAUNCH_BOUNDS __launch_bounds__(1024)
+#else
+#define OF_HIP_BLOCK_LAUNCH_BOUNDS
+#endif
+#endif
+
 template<typename T>
 struct SumOp {
   __device__ __forceinline__ T operator()(const T& a, const T& b) const { return a + b; }
@@ -572,7 +583,7 @@ inline cudaError_t DispatchLayerNormWarpImpl(cudaStream_t stream, LOAD load, STO
 }
 
 template<typename LOAD, typename STORE, typename ComputeType, int pack_size, int block_size>
-__global__ void __launch_bounds__(1024)
+__global__ void OF_HIP_BLOCK_LAUNCH_BOUNDS
     LayerNormBlockSMemImpl(LOAD load, STORE store, const int64_t rows, const int64_t cols,
                            const double epsilon, ComputeType* mean, ComputeType* inv_variance) {
   using LoadType = typename LOAD::LoadType;
@@ -1166,7 +1177,7 @@ inline cudaError_t DispatchLayerNormGradWarpImpl(cudaStream_t stream, LOAD_X loa
 
 template<typename LOAD_X, typename LOAD_SCALED_DY, typename STORE, typename ComputeType,
          int pack_size, int block_size>
-__global__ void __launch_bounds__(1024)
+__global__ void OF_HIP_BLOCK_LAUNCH_BOUNDS
     LayerNormGradBlockSMemImpl(LOAD_X load_x, LOAD_SCALED_DY load_scaled_dy, STORE store,
                                const ComputeType* mean, const ComputeType* inv_variance,
                                const int64_t rows, const int64_t cols) {
@@ -1398,7 +1409,7 @@ inline cudaError_t TryDispatchLayerNormGradBlockSMemImpl(cudaStream_t stream, LO
 
 template<typename LOAD_X, typename LOAD_SCALED_DY, typename STORE, typename ComputeType,
          int pack_size, int block_size>
-__global__ void __launch_bounds__(1024)
+__global__ void OF_HIP_BLOCK_LAUNCH_BOUNDS
     LayerNormGradBlockUncachedImpl(LOAD_X load_x, LOAD_SCALED_DY load_scaled_dy, STORE store,
                                    const ComputeType* mean, const ComputeType* inv_variance,
                                    const int64_t rows, const int64_t cols) {

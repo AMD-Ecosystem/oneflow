@@ -283,7 +283,7 @@ cudaError_t DispatchLaunchRmsNormWarpImpl(cudaStream_t stream, LOAD load, STORE 
 }
 
 template<typename LOAD, typename STORE, typename ComputeType, int pack_size, int block_size>
-__global__ void __launch_bounds__(1024)
+__global__ void OF_HIP_BLOCK_LAUNCH_BOUNDS
     RmsNormBlockSMemImpl(LOAD load, STORE store, const int nrow, const int ncol, const double eps,
                          ComputeType* inv_rms) {
   extern __shared__ __align__(sizeof(double)) unsigned char shared_buf[];
@@ -410,7 +410,7 @@ cudaError_t TryDispatchLaunchRmsNormBlockSMemImpl(cudaStream_t stream, LOAD load
 }
 
 template<typename LOAD, typename STORE, typename ComputeType, int pack_size, int block_size>
-__global__ void __launch_bounds__(1024)
+__global__ void OF_HIP_BLOCK_LAUNCH_BOUNDS
     RmsNormBlockUncachedImpl(LOAD load, STORE store, const int nrow, const int ncol,
                              const double eps, ComputeType* inv_rms) {
   assert(ncol % pack_size == 0);
@@ -699,7 +699,7 @@ cudaError_t DispatchLaunchRmsNormGradWarpImplPackSize(cudaStream_t stream, const
 
 template<typename LOAD_X, typename LOAD_DY, typename STORE, typename ComputeType, int pack_size,
          int block_size>
-__global__ void __launch_bounds__(1024)
+__global__ void OF_HIP_BLOCK_LAUNCH_BOUNDS
     RmsNormGradBlockSMemImpl(const int nrow, const int ncol, LOAD_X load_x, LOAD_DY load_dy,
                              STORE store, const ComputeType* inv_rms) {
   extern __shared__ __align__(sizeof(double)) unsigned char dyn_smem[];
@@ -827,7 +827,7 @@ cudaError_t TryDispatchLaunchRmsNormGradBlockSMemImplPackSize(
 
 template<typename LOAD_X, typename LOAD_DY, typename STORE, typename ComputeType, int pack_size,
          int block_size>
-__global__ void __launch_bounds__(1024)
+__global__ void OF_HIP_BLOCK_LAUNCH_BOUNDS
     RmsNormGradBlockUncachedImpl(const int nrow, const int ncol, LOAD_X load_x, LOAD_DY load_dy,
                                  STORE store, const ComputeType* inv_rms) {
   assert(ncol % pack_size == 0);
