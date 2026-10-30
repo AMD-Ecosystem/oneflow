@@ -22,6 +22,7 @@ if(BUILD_CUDA AND USE_HIP)
   find_package(rccl REQUIRED) # NCCL -> RCCL; the collective-comm backend links it
   find_package(hipsolver REQUIRED)
   find_package(miopen REQUIRED) # cuDNN -> MIOpen, through the cudnn.h shim header
+  find_package(hipblaslt REQUIRED) # cuBLASLt -> hipBLASLt, through the cublasLt.h shim header
 
   # Link hip::host (the HIP runtime) but NOT hip::device: hip::device carries an
   # INTERFACE_COMPILE_OPTIONS of `-x hip --offload-arch=<arch>` gated on
@@ -29,18 +30,13 @@ if(BUILD_CUDA AND USE_HIP)
   # monolith -- recompiling them as HIP device code (wrong; they are plain C++). Device
   # codegen for the .cu (LANGUAGE HIP) sources comes from the target's HIP_ARCHITECTURES
   # property, not from hip::device, so dropping hip::device is correct: the host link still
-  # gets the runtime via hip::host. The same reason excludes roc::hipblaslt below (it
-  # transitively pulls hip::device).
+  # gets the runtime via hip::host.
   list(APPEND VENDOR_CUDA_LIBRARIES hip::host)
   list(APPEND VENDOR_CUDA_LIBRARIES roc::hipblas hip::hiprand roc::rocrand hip::hipfft)
   # RCCL satisfies the nccl* symbols the collective-comm GPU backend references (the compat
   # header maps <nccl.h> to <rccl/rccl.h>); roc::rccl pulls only hip::host, no hip::device.
   list(APPEND VENDOR_CUDA_LIBRARIES roc::rccl)
-  list(APPEND VENDOR_CUDA_LIBRARIES roc::hipsolver MIOpen)
-  # hipblaslt backs only the deferred fused-MLP kernels (excluded from the HIP glob), and
-  # roc::hipblaslt re-propagates hip::device's -x hip onto the host .cpp; do not link it into
-  # the monolith. Its handle TYPE still resolves via the __clang__-gated header in
-  # cuda_to_hip.h on the HIP-language TUs that include it.
+  list(APPEND VENDOR_CUDA_LIBRARIES roc::hipsolver MIOpen roc::hipblaslt)
   message(STATUS "VENDOR_CUDA_LIBRARIES (HIP): ${VENDOR_CUDA_LIBRARIES}")
 
   set(CUDA_VERSION "0.0" CACHE STRING "" FORCE) # unused on HIP; satisfies version guards

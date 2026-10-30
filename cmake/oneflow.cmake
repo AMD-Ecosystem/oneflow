@@ -249,23 +249,20 @@ include_directories(${PROJECT_BINARY_DIR})
 if(USE_HIP)
   # GPU TUs excluded from the HIP monolith because they are not ported yet. Each has a
   # genuine library/API gap, not a mechanical port:
-  #  - the cuBLASLt fused-MLP / grouped-GEMM / matmul-bias family (hipBLASLt API differs:
-  #    hipblasLtMatmul descriptor surface and hipblasGemmStridedBatchedEx signature);
   #  - the CUTLASS/CuTe + wmma fused kernels (CUTLASS does not port to ROCm; would be a
   #    Composable-Kernel reimplementation);
   #  - the one_embedding P2P/IPC shuffle kernels.
   # Everything else (the ep/cuda/primitive tensor ops and the bulk of user/kernels)
   # compiles as HIP.
   list(FILTER of_all_obj_cc EXCLUDE REGEX
-       "oneflow/user/kernels/(grouped_matmul_bias|fused_matmul_bias_add_relu_dropout|fused_matmul_bias_kernel|cublas_fused_mlp_kernel|cublas_fused_mlp_grad_kernel|cublas_bias_add_relu_matmul_grad_kernel|cublas_fused_matmul_bias_add_grad|fused_dot_feature_interaction_kernel|fused_attention_kernels|fused_glu_kernel|fused_multi_head_attention_inference_kernel|one_embedding_embedding_shuffle_p2p_kernel|one_embedding_embedding_gradient_shuffle_p2p_kernel)\\.cu$")
+       "oneflow/user/kernels/(fused_dot_feature_interaction_kernel|fused_attention_kernels|fused_multi_head_attention_inference_kernel|one_embedding_embedding_shuffle_p2p_kernel|one_embedding_embedding_gradient_shuffle_p2p_kernel)\\.cu$")
   # oneflow's source glob compiles every .cuh as a standalone TU. Three .cuh are not
   # self-contained -- they live inside namespace oneflow::cuda and use symbols their .cu
   # includer pulled in first (cuda::softmax::Pack for fused_softmax; ep::primitive::CopyNd
   # for one_embedding_data_shuffle; the cublasLt descriptor types for cublas_fused_mlp_util)
   # without including the defining headers themselves. nvcc tolerates the standalone pass;
-  # clang does not. Their code is still built inside the .cu that include them (the
-  # cublas_fused_mlp_util consumers are all deferred anyway), so drop only the redundant
-  # standalone compile. The other 16 .cuh are self-contained and compile as HIP.
+  # clang does not. Their code is still built inside the .cu that include them, so drop only
+  # the redundant standalone compile. The other 16 .cuh are self-contained and compile as HIP.
   list(FILTER of_all_obj_cc EXCLUDE REGEX
        "oneflow/user/kernels/(fused_softmax|one_embedding_data_shuffle|cublas_fused_mlp_util)\\.cuh$")
 endif()

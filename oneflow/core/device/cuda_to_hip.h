@@ -40,6 +40,7 @@ limitations under the License.
 
 // libc host declarations must be seen before HIP's __device__ memcpy/memset overloads,
 // so include them before <hip/hip_runtime.h>.
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 
@@ -98,29 +99,6 @@ limitations under the License.
 #endif
 
 #include <hip/library_types.h>
-
-// Handle types only: ep/cuda/cuda_stream.h declares cudnn/cusolver/cublasLt handle
-// members, so the types must resolve even though their *operations* (conv/pool via
-// MIOpen, cuSOLVER, the fused-MLP cuBLASLt kernels) are deferred and their TUs are
-// excluded from the HIP monolith glob. Pull the matching ROCm headers and alias the
-// handle typedefs; do not alias the operation entry points here. These ROCm library
-// headers transitively include the clang-only device-math headers, so they are gated on
-// __clang__ like the math headers above; the GPU host .cpp that include cuda_stream.h are
-// retagged LANGUAGE HIP so the handle types resolve there.
-#if defined(__clang__) && defined(__has_include)
-#if __has_include(<hipblaslt/hipblaslt.h>)
-#include <hipblaslt/hipblaslt.h>
-#define cublasLtHandle_t hipblasLtHandle_t
-#endif
-#if __has_include(<hipsolver/hipsolver.h>)
-#include <hipsolver/hipsolver.h>
-#define cusolverDnHandle_t hipsolverHandle_t
-#endif
-#if __has_include(<miopen/miopen.h>)
-#include <miopen/miopen.h>
-#define cudnnHandle_t miopenHandle_t
-#endif
-#endif
 
 // ---- CUDA runtime --------------------------------------------------------------
 #define cudaError_t hipError_t

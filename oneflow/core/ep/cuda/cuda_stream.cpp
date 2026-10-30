@@ -166,14 +166,10 @@ CudaStream::CudaStream(CudaDevice* device)
   OF_CUBLAS_CHECK(cublasCreate(&cublas_handle_));
   OF_CUBLAS_CHECK(cublasSetStream(cublas_handle_, cuda_stream_));
   if (need_check_version) { CheckCublasVersion(cublas_handle_); }
-  // On ROCm the cublasLt handle backs only the deferred fused-MLP / grouped-GEMM kernels, whose
-  // TUs are excluded from the HIP build; hipBLASLt is not linked, so skip creating it here.
-#if !defined(USE_HIP)
 #if CUDA_VERSION >= 10010
   // cublas_lt_handle
   OF_CUBLAS_CHECK(cublasLtCreate(&cublas_lt_handle_));
 #endif
-#endif  // !USE_HIP
 #if CUBLAS_VERSION >= 11000
   if (ParseBooleanFromEnv("ONEFLOW_EP_CUDA_ENABLE_TF32_EXECUTION", true)) {
     OF_CUBLAS_CHECK(cublasSetMathMode(cublas_handle_, CUBLAS_TF32_TENSOR_OP_MATH));
@@ -205,11 +201,9 @@ CudaStream::~CudaStream() {
 #if CUDA_VERSION >= 11000
   OF_CUSOLVER_CHECK(cusolverDnDestroy(cusolver_dn_handle_));
 #endif
-#if !defined(USE_HIP)
 #if CUDA_VERSION >= 10010
   OF_CUBLAS_CHECK(cublasLtDestroy(cublas_lt_handle_));
 #endif
-#endif  // !USE_HIP
   OF_CUDA_CHECK(cudaStreamDestroy(cuda_stream_));
   OF_CUDA_CHECK(cudaFree(workspace_));
 }
