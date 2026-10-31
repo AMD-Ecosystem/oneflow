@@ -125,8 +125,10 @@ void GetPtrs(user_op::KernelComputeContext* ctx,
              std::vector<void*>* is_kernel_start_ptr) {
   const int64_t parallel_id = ctx->parallel_ctx().parallel_id();
   const int64_t parallel_num = ctx->parallel_ctx().parallel_num();
+#if !defined(USE_HIP)
   unique_partitioned_embedding_grad_ptr->at(parallel_id) =
       const_cast<void*>(ctx->Tensor4ArgNameAndIndex("embedding_grad", 0)->dptr());
+#endif  // !defined(USE_HIP)
   std::string name = ctx->op_name();
   {
     std::vector<IpcMemHandleOffset> push_handle_offset;
@@ -198,11 +200,26 @@ class DataShuffleKernelState final : public user_op::OpKernelState {
     OF_CUDA_CHECK(cudaMalloc(&is_kernel_start_ptr_.at(parallel_id_), is_kernel_start_size));
 #endif  // defined(USE_HIP)
     OF_CUDA_CHECK(cudaMemset(is_kernel_start_ptr_.at(parallel_id_), 0, is_kernel_start_size));
+#if defined(USE_HIP)
+    // A peer's reads of ordinary device memory can miss writes still held in this GPU's L2:
+    // neither the end of the kernel that wrote them nor the barrier's system-scope release writes
+    // them back on every AMD GPU. Peers therefore read the gradient from an uncached staging
+    // buffer, filled before the barrier.
+    const user_op::TensorDesc* embedding_grad =
+        ctx->TensorDesc4ArgNameAndIndex("embedding_grad", 0);
+    OF_CUDA_CHECK(hipExtMallocWithFlags(
+        &unique_partitioned_embedding_grad_ptr_.at(parallel_id_),
+        embedding_grad->shape().elem_cnt() * GetSizeOfDataType(embedding_grad->data_type()),
+        hipDeviceMallocUncached));
+#endif  // defined(USE_HIP)
   }
 
   ~DataShuffleKernelState() {
     CudaCurrentDeviceGuard guard(device_index_);
     OF_CUDA_CHECK(cudaFree(is_kernel_start_ptr_.at(parallel_id_)));
+#if defined(USE_HIP)
+    OF_CUDA_CHECK(cudaFree(unique_partitioned_embedding_grad_ptr_.at(parallel_id_)));
+#endif  // defined(USE_HIP)
   }
 
   std::vector<void*>* UniquePartitionedEmbeddingGrads() {
@@ -331,8 +348,14 @@ class EmbeddingGraidientShuffleP2PKernel final : public user_op::OpKernel,
     if (current_iter_ == 0) {
       GetPtrs(ctx, kernel_state->UniquePartitionedEmbeddingGrads(), kernel_state->IsKernelStart());
     }
+#if defined(USE_HIP)
+    OF_CUDA_CHECK(cudaMemcpyAsync(
+        kernel_state->UniquePartitionedEmbeddingGrads()->at(parallel_id), embedding_grad->dptr(),
+        embedding_grad->shape_view().elem_cnt() * sizeof(T), cudaMemcpyDefault, cuda_stream));
+#else
     CHECK_EQ(kernel_state->UniquePartitionedEmbeddingGrads()->at(parallel_id),
              embedding_grad->dptr());
+#endif  // defined(USE_HIP)
     Param<T, IDX, pack_size, 8> param;
     CHECK_EQ(embedding_size % pack_size, 0);
     CHECK_LE(parallel_num, 8);
