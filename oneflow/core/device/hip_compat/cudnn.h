@@ -43,6 +43,7 @@ limitations under the License.
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -192,7 +193,32 @@ inline const char* cudnnGetErrorString(cudnnStatus_t status) {
 
 inline cudnnStatus_t cudnnCreate(miopenHandle_t* handle) { return miopenCreate(handle); }
 
-inline cudnnStatus_t cudnnDestroy(miopenHandle_t handle) { return miopenDestroy(handle); }
+namespace oneflow_hip_cudnn {
+
+// The convolution problems Find has run for on each live handle (see FirstRunOnHandle). Never
+// destroyed, so handles released during exit can still drop their entry.
+struct FindRecords {
+  std::mutex mutex;
+  std::unordered_map<miopenHandle_t, std::unordered_set<std::string>> problems;
+};
+
+inline FindRecords* GetFindRecords() {
+  static FindRecords* records = new FindRecords;
+  return records;
+}
+
+}  // namespace oneflow_hip_cudnn
+
+// A destroyed handle's Find record is dropped: the next miopenCreate can return the same address,
+// and MIOpen has run no Find on that new handle.
+inline cudnnStatus_t cudnnDestroy(miopenHandle_t handle) {
+  oneflow_hip_cudnn::FindRecords* records = oneflow_hip_cudnn::GetFindRecords();
+  {
+    std::lock_guard<std::mutex> lock(records->mutex);
+    records->problems.erase(handle);
+  }
+  return miopenDestroy(handle);
+}
 
 inline cudnnStatus_t cudnnSetStream(miopenHandle_t handle, hipStream_t stream) {
   return miopenSetStream(handle, stream);
@@ -694,7 +720,7 @@ inline bool FirstRunOnHandle(miopenHandle_t handle, int direction, miopenTensorD
                              miopenTensorDescriptor_t b, miopenTensorDescriptor_t c,
                              miopenConvolutionDescriptor_t conv) {
   std::ostringstream os;
-  os << static_cast<const void*>(handle) << '|' << direction << '|';
+  os << direction << '|';
   AppendTensor(&os, a);
   AppendTensor(&os, b);
   AppendTensor(&os, c);
@@ -711,10 +737,9 @@ inline bool FirstRunOnHandle(miopenHandle_t handle, int direction, miopenTensorD
     os << pads[i] << '/' << strides[i] << '/' << dilations[i] << ',';
   }
   os << groups;
-  static std::mutex mutex;
-  static std::unordered_set<std::string> seen;
-  std::lock_guard<std::mutex> lock(mutex);
-  return seen.insert(os.str()).second;
+  FindRecords* records = GetFindRecords();
+  std::lock_guard<std::mutex> lock(records->mutex);
+  return records->problems[handle].insert(os.str()).second;
 }
 
 }  // namespace oneflow_hip_cudnn
