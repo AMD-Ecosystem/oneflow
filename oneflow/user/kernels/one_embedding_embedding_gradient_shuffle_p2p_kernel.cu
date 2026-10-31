@@ -188,7 +188,15 @@ class DataShuffleKernelState final : public user_op::OpKernelState {
     unique_partitioned_embedding_grad_ptr_.resize(parallel_num);
     is_kernel_start_ptr_.resize(parallel_num);
     size_t is_kernel_start_size = GetCudaAlignedSize(parallel_num * sizeof(int32_t));
+#if defined(USE_HIP)
+    // Peers poll these flags across the fabric. A peer's read does not see a write held in this
+    // GPU's L2 for ordinary device memory, so the barrier would never release; uncached memory
+    // makes every flag access go to memory.
+    OF_CUDA_CHECK(hipExtMallocWithFlags(&is_kernel_start_ptr_.at(parallel_id_),
+                                        is_kernel_start_size, hipDeviceMallocUncached));
+#else
     OF_CUDA_CHECK(cudaMalloc(&is_kernel_start_ptr_.at(parallel_id_), is_kernel_start_size));
+#endif  // defined(USE_HIP)
     OF_CUDA_CHECK(cudaMemset(is_kernel_start_ptr_.at(parallel_id_), 0, is_kernel_start_size));
   }
 
