@@ -880,10 +880,25 @@ inline cudnnStatus_t cudnnPoolingForward(miopenHandle_t handle,
                                          const void* x, const void* beta,
                                          const cudnnTensorDescriptor_t y_desc, void* y) {
   if (!oneflow_hip_cudnn::IsOne(alpha, y_desc)) { return miopenStatusUnsupportedOp; }
-  return oneflow_hip_cudnn::RunWithBeta(handle, beta, y_desc, y, [&](const void* zero, void* out) {
-    return miopenPoolingForward(handle, pool_desc->desc, alpha, x_desc, x, zero, y_desc, out, false,
-                                nullptr, 0);
-  });
+  hipStream_t stream = nullptr;
+  miopenStatus_t status = miopenGetStream(handle, &stream);
+  if (status != miopenStatusSuccess) { return status; }
+  // MIOpen pools NHWC tensors by transposing through the workspace, so the forward pass needs one
+  // even when it records no indices.
+  size_t workspace_size = 0;
+  status = miopenPoolingGetWorkSpaceSizeV2(pool_desc->desc, y_desc, &workspace_size);
+  if (status != miopenStatusSuccess) { return status; }
+  void* workspace = nullptr;
+  if (workspace_size > 0 && hipMallocAsync(&workspace, workspace_size, stream) != hipSuccess) {
+    return miopenStatusAllocFailed;
+  }
+  status =
+      oneflow_hip_cudnn::RunWithBeta(handle, beta, y_desc, y, [&](const void* zero, void* out) {
+        return miopenPoolingForward(handle, pool_desc->desc, alpha, x_desc, x, zero, y_desc, out,
+                                    false, workspace, workspace_size);
+      });
+  if (workspace != nullptr) { (void)hipFreeAsync(workspace, stream); }
+  return status;
 }
 
 inline cudnnStatus_t cudnnPoolingBackward(miopenHandle_t handle,
@@ -900,11 +915,14 @@ inline cudnnStatus_t cudnnPoolingBackward(miopenHandle_t handle,
   void* workspace = nullptr;
   void* y_tmp = nullptr;
   size_t workspace_size = 0;
+  status = miopenPoolingGetWorkSpaceSizeV2(pool_desc->desc, y_desc, &workspace_size);
+  if (status != miopenStatusSuccess) { return status; }
+  if (workspace_size > 0 && hipMallocAsync(&workspace, workspace_size, stream) != hipSuccess) {
+    return miopenStatusAllocFailed;
+  }
   if (pool_desc->mode == CUDNN_POOLING_MAX) {
-    status = miopenPoolingGetWorkSpaceSizeV2(pool_desc->desc, y_desc, &workspace_size);
-    if (status != miopenStatusSuccess) { return status; }
-    if (hipMallocAsync(&workspace, workspace_size, stream) != hipSuccess
-        || hipMallocAsync(&y_tmp, oneflow_hip_cudnn::NumBytes(y_desc), stream) != hipSuccess) {
+    if (hipMallocAsync(&y_tmp, oneflow_hip_cudnn::NumBytes(y_desc), stream) != hipSuccess) {
+      if (workspace != nullptr) { (void)hipFreeAsync(workspace, stream); }
       return miopenStatusAllocFailed;
     }
     status = miopenPoolingForward(handle, pool_desc->desc, oneflow_hip_cudnn::OnePtr(y_desc),
