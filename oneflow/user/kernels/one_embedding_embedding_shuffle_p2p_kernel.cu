@@ -119,9 +119,8 @@ __global__ void BarrierKernel(int32_t parallel_id, int32_t parallel_num,
   int count = param.is_kernel_start[parallel_id][parallel_id];
   if (threadIdx.x < parallel_num) {
 #if defined(USE_HIP)
-    // The flags are read by peer GPUs across the fabric. System-scope release and acquire write
-    // back and invalidate this GPU's L2, so neither side spins on a stale cached copy, and the
-    // data the peers read after the barrier is visible to them.
+    // The flags live in uncached memory and are polled by peer GPUs across the fabric.
+    // System-scope atomics order each flag with this GPU's earlier accesses.
     __hip_atomic_store(param.is_kernel_start[parallel_id] + threadIdx.x, count + 1,
                        __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     while (__hip_atomic_load(param.is_kernel_start[threadIdx.x] + parallel_id, __ATOMIC_ACQUIRE,
