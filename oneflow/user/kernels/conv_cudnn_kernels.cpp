@@ -24,6 +24,7 @@ limitations under the License.
 #include "oneflow/core/ep/cuda/cuda_stream.h"
 #include "oneflow/core/job/lazy_mode.h"
 #if defined(USE_HIP)
+#include "oneflow/core/ep/include/primitive/cast.h"
 #include "oneflow/core/ep/include/primitive/fill.h"
 #include "oneflow/core/ep/include/primitive/matmul.h"
 #endif  // defined(USE_HIP)
@@ -392,6 +393,26 @@ struct ConvBiasGradState final : public user_op::OpKernelState {
   std::unique_ptr<CudnnTensorDesc> bias_diff_desc;
 };
 
+#if defined(USE_HIP)
+// Byte offsets into the channels_first bias gradient's scratch: ones over the spatial axis in
+// dy's type, then, in the accumulation type, ones over the samples, the per-(sample, channel)
+// sums and the unrounded gradient.
+struct ConvBiasGradHipLayout {
+  ConvBiasGradHipLayout(DataType data_type, int64_t num, int64_t channels, int64_t spatial) {
+    const size_t acc_size =
+        GetSizeOfDataType(data_type == DataType::kDouble ? DataType::kDouble : DataType::kFloat);
+    num_ones = GetCudaAlignedSize(spatial * GetSizeOfDataType(data_type));
+    row_sums = num_ones + GetCudaAlignedSize(num * acc_size);
+    bias_diff = row_sums + GetCudaAlignedSize(num * channels * acc_size);
+    size = bias_diff + GetCudaAlignedSize(channels * acc_size);
+  }
+  size_t num_ones;
+  size_t row_sums;
+  size_t bias_diff;
+  size_t size;
+};
+
+#endif  // defined(USE_HIP)
 class ConvBiasGradGpuKernel final : public user_op::OpKernel, public user_op::CudaGraphSupport {
  public:
   ConvBiasGradGpuKernel() = default;
@@ -447,26 +468,72 @@ class ConvBiasGradGpuKernel final : public user_op::OpKernel, public user_op::Cu
       fill->Launch(ctx->stream(), bias_diff->mut_dptr(), Scalar(0), channels);
       return;
     }
-    user_op::Tensor* ones = ctx->Tensor4ArgNameAndIndex("tmp_buffer", 0);
-    fill->Launch(ctx->stream(), ones->mut_dptr(), Scalar(1),
-                 channels_first ? spatial : num * spatial);
-    auto matmul = ep::primitive::NewPrimitive<ep::primitive::MatmulFactory>(
-        DeviceType::kCUDA, data_type,
-        channels_first ? ep::primitive::BlasTransposeType::N : ep::primitive::BlasTransposeType::T,
-        ep::primitive::BlasTransposeType::N);
-    CHECK(matmul);
+    user_op::Tensor* tmp_buffer = ctx->Tensor4ArgNameAndIndex("tmp_buffer", 0);
     if (channels_first) {
-      // bias_diff += dy[i] (channels x spatial) * ones, one sample at a time.
-      const size_t sample_bytes = channels * spatial * GetSizeOfDataType(data_type);
-      for (int64_t i = 0; i < num; ++i) {
-        matmul->Launch(ctx->stream(), channels, 1, spatial, Scalar(1),
-                       dy->dptr<char>() + i * sample_bytes, ones->dptr(), Scalar(i == 0 ? 0 : 1),
-                       bias_diff->mut_dptr());
+      // Sum every (sample, channel) row of dy over the spatial axis into a float (double for
+      // double dy) scratch, then sum the rows over the samples, so that a float16 or bfloat16
+      // gradient is accumulated in float and rounded once.
+      const DataType acc_type =
+          data_type == DataType::kDouble ? DataType::kDouble : DataType::kFloat;
+      const ConvBiasGradHipLayout layout(data_type, num, channels, spatial);
+      char* spatial_ones = tmp_buffer->mut_dptr<char>();
+      char* num_ones = spatial_ones + layout.num_ones;
+      char* row_sums = spatial_ones + layout.row_sums;
+      fill->Launch(ctx->stream(), spatial_ones, Scalar(1), spatial);
+      auto acc_fill =
+          ep::primitive::NewPrimitive<ep::primitive::FillFactory>(DeviceType::kCUDA, acc_type);
+      CHECK(acc_fill);
+      acc_fill->Launch(ctx->stream(), num_ones, Scalar(1), num);
+      const auto GetHipDataType = [](DataType type) {
+        switch (type) {
+          case DataType::kFloat16: return CUDA_R_16F;
+          case DataType::kBFloat16: return CUDA_R_16BF;
+          case DataType::kFloat: return CUDA_R_32F;
+          case DataType::kDouble: return CUDA_R_64F;
+          default: UNIMPLEMENTED(); return CUDA_R_32F;
+        }
+      };
+      const int64_t rows = num * channels;
+      CHECK_LE(rows, std::numeric_limits<int>::max());
+      CHECK_LE(spatial, std::numeric_limits<int>::max());
+      const float f_one = 1;
+      const float f_zero = 0;
+      const double d_one = 1;
+      const double d_zero = 0;
+      const bool is_double = acc_type == DataType::kDouble;
+      OF_CUBLAS_CHECK(cublasGemmEx(
+          ctx->stream()->As<ep::CudaStream>()->cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+          static_cast<int>(rows), 1, static_cast<int>(spatial),
+          is_double ? static_cast<const void*>(&d_one) : static_cast<const void*>(&f_one),
+          dy->dptr(), GetHipDataType(data_type), static_cast<int>(spatial), spatial_ones,
+          GetHipDataType(data_type), static_cast<int>(spatial),
+          is_double ? static_cast<const void*>(&d_zero) : static_cast<const void*>(&f_zero),
+          row_sums, GetHipDataType(acc_type), static_cast<int>(rows),
+          is_double ? CUBLAS_COMPUTE_64F : CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+      auto matmul = ep::primitive::NewPrimitive<ep::primitive::MatmulFactory>(
+          DeviceType::kCUDA, acc_type, ep::primitive::BlasTransposeType::T,
+          ep::primitive::BlasTransposeType::N);
+      CHECK(matmul);
+      // row_sums is num x channels.
+      void* acc_bias_diff =
+          acc_type == data_type ? bias_diff->mut_dptr() : spatial_ones + layout.bias_diff;
+      matmul->Launch(ctx->stream(), channels, 1, num, Scalar(1), row_sums, num_ones, Scalar(0),
+                     acc_bias_diff);
+      if (acc_type != data_type) {
+        auto cast = ep::primitive::NewPrimitive<ep::primitive::CastFactory>(DeviceType::kCUDA,
+                                                                            acc_type, data_type);
+        CHECK(cast);
+        cast->Launch(ctx->stream(), acc_bias_diff, bias_diff->mut_dptr(), channels);
       }
     } else {
       // dy is (num * spatial) x channels.
-      matmul->Launch(ctx->stream(), channels, 1, num * spatial, Scalar(1), dy->dptr(), ones->dptr(),
-                     Scalar(0), bias_diff->mut_dptr());
+      fill->Launch(ctx->stream(), tmp_buffer->mut_dptr(), Scalar(1), num * spatial);
+      auto matmul = ep::primitive::NewPrimitive<ep::primitive::MatmulFactory>(
+          DeviceType::kCUDA, data_type, ep::primitive::BlasTransposeType::T,
+          ep::primitive::BlasTransposeType::N);
+      CHECK(matmul);
+      matmul->Launch(ctx->stream(), channels, 1, num * spatial, Scalar(1), dy->dptr(),
+                     tmp_buffer->dptr(), Scalar(0), bias_diff->mut_dptr());
     }
 #else
     std::unique_ptr<CudnnTensorDesc> dy_desc;
@@ -486,9 +553,11 @@ REGISTER_USER_KERNEL("conv_bias_grad")
 #if defined(USE_HIP)
     .SetInferTmpSizeFn([](user_op::InferContext* ctx) -> size_t {
       const Shape& shape = ctx->InputTensorDesc("dy", 0).shape();
-      const bool channels_first = (ctx->Attr<std::string>("data_format") == "channels_first");
-      const int64_t ones = channels_first ? shape.Count(2) : shape.Count(0, shape.NumAxes() - 1);
-      return ones * GetSizeOfDataType(ctx->InputTensorDesc("dy", 0).data_type());
+      const DataType data_type = ctx->InputTensorDesc("dy", 0).data_type();
+      if (ctx->Attr<std::string>("data_format") == "channels_first") {
+        return ConvBiasGradHipLayout(data_type, shape.At(0), shape.At(1), shape.Count(2)).size;
+      }
+      return shape.Count(0, shape.NumAxes() - 1) * GetSizeOfDataType(data_type);
     })
 #endif  // defined(USE_HIP)
     .SetIsMatchedHob(user_op::HobDeviceType() == DeviceType::kCUDA);
