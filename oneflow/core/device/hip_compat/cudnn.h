@@ -816,17 +816,6 @@ inline cudnnStatus_t cudnnConvolutionBackwardFilter(
       });
 }
 
-inline cudnnStatus_t cudnnConvolutionBackwardBias(miopenHandle_t handle, const void* alpha,
-                                                  const cudnnTensorDescriptor_t dy_desc,
-                                                  const void* dy, const void* beta,
-                                                  const cudnnTensorDescriptor_t db_desc, void* db) {
-  if (!oneflow_hip_cudnn::IsOne(alpha, db_desc)) { return miopenStatusUnsupportedOp; }
-  return oneflow_hip_cudnn::RunWithBeta(
-      handle, beta, db_desc, db, [&](const void* zero, void* out) {
-        return miopenConvolutionBackwardBias(handle, alpha, dy_desc, dy, zero, db_desc, out);
-      });
-}
-
 // ---- activation (descriptor only; used by the Ex batch-norm API) ----------------
 typedef miopenActivationDescriptor_t cudnnActivationDescriptor_t;
 typedef enum { CUDNN_ACTIVATION_RELU = 1 } cudnnActivationMode_t;

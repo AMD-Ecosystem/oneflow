@@ -23,6 +23,10 @@ limitations under the License.
 #include "oneflow/core/kernel/cuda_graph_support.h"
 #include "oneflow/core/ep/cuda/cuda_stream.h"
 #include "oneflow/core/job/lazy_mode.h"
+#if defined(USE_HIP)
+#include "oneflow/core/ep/include/primitive/fill.h"
+#include "oneflow/core/ep/include/primitive/matmul.h"
+#endif  // defined(USE_HIP)
 
 namespace oneflow {
 
@@ -427,6 +431,44 @@ class ConvBiasGradGpuKernel final : public user_op::OpKernel, public user_op::Cu
 
     const std::string& data_format = ctx->Attr<std::string>("data_format");
 
+#if defined(USE_HIP)
+    // MIOpen no longer implements bias backward (miopenConvolutionBackwardBias returns
+    // miopenStatusNotImplemented), so the bias gradient is dy times a vector of ones.
+    const ShapeView& shape = dy->shape_view();
+    const bool channels_first = (data_format == "channels_first");
+    const int64_t num = shape.At(0);
+    const int64_t channels = channels_first ? shape.At(1) : shape.At(shape.NumAxes() - 1);
+    const int64_t spatial = channels_first ? shape.Count(2) : shape.Count(1, shape.NumAxes() - 1);
+    const DataType data_type = dy->data_type();
+    auto fill =
+        ep::primitive::NewPrimitive<ep::primitive::FillFactory>(DeviceType::kCUDA, data_type);
+    CHECK(fill);
+    if (num * spatial == 0) {
+      fill->Launch(ctx->stream(), bias_diff->mut_dptr(), Scalar(0), channels);
+      return;
+    }
+    user_op::Tensor* ones = ctx->Tensor4ArgNameAndIndex("tmp_buffer", 0);
+    fill->Launch(ctx->stream(), ones->mut_dptr(), Scalar(1),
+                 channels_first ? spatial : num * spatial);
+    auto matmul = ep::primitive::NewPrimitive<ep::primitive::MatmulFactory>(
+        DeviceType::kCUDA, data_type,
+        channels_first ? ep::primitive::BlasTransposeType::N : ep::primitive::BlasTransposeType::T,
+        ep::primitive::BlasTransposeType::N);
+    CHECK(matmul);
+    if (channels_first) {
+      // bias_diff += dy[i] (channels x spatial) * ones, one sample at a time.
+      const size_t sample_bytes = channels * spatial * GetSizeOfDataType(data_type);
+      for (int64_t i = 0; i < num; ++i) {
+        matmul->Launch(ctx->stream(), channels, 1, spatial, Scalar(1),
+                       dy->dptr<char>() + i * sample_bytes, ones->dptr(), Scalar(i == 0 ? 0 : 1),
+                       bias_diff->mut_dptr());
+      }
+    } else {
+      // dy is (num * spatial) x channels.
+      matmul->Launch(ctx->stream(), channels, 1, num * spatial, Scalar(1), dy->dptr(), ones->dptr(),
+                     Scalar(0), bias_diff->mut_dptr());
+    }
+#else
     std::unique_ptr<CudnnTensorDesc> dy_desc;
     dy_desc.reset(new CudnnTensorDesc(dy->data_type(), dy->shape_view(), data_format));
     const auto& bias_grad_state = CreateConvBiasGradState(ctx);
@@ -435,11 +477,20 @@ class ConvBiasGradGpuKernel final : public user_op::OpKernel, public user_op::Cu
         ctx->stream()->As<ep::CudaStream>()->cudnn_handle(), CudnnSPOnePtr(dy->data_type()),
         dy_desc->Get(), dy->dptr(), CudnnSPZeroPtr(dy->data_type()),
         bias_grad_state->bias_diff_desc->Get(), bias_diff->mut_dptr()));
+#endif  // defined(USE_HIP)
   }
 };
 
 REGISTER_USER_KERNEL("conv_bias_grad")
     .SetCreateFn<ConvBiasGradGpuKernel>()
+#if defined(USE_HIP)
+    .SetInferTmpSizeFn([](user_op::InferContext* ctx) -> size_t {
+      const Shape& shape = ctx->InputTensorDesc("dy", 0).shape();
+      const bool channels_first = (ctx->Attr<std::string>("data_format") == "channels_first");
+      const int64_t ones = channels_first ? shape.Count(2) : shape.Count(0, shape.NumAxes() - 1);
+      return ones * GetSizeOfDataType(ctx->InputTensorDesc("dy", 0).data_type());
+    })
+#endif  // defined(USE_HIP)
     .SetIsMatchedHob(user_op::HobDeviceType() == DeviceType::kCUDA);
 
 }  // namespace
