@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
 import unittest
 from collections import OrderedDict
 
@@ -25,6 +26,66 @@ from oneflow.test_utils.test_util import GenArgList
 import oneflow as flow
 import oneflow.unittest
 
+
+def _test_batchnorm_float64(test_case, shape, channels_last, affine, track_running_stats):
+    import torch
+
+    rng = np.random.RandomState(sum(shape))
+    np_x = rng.randn(*shape) * 3 + 0.5
+    np_dy = rng.randn(*shape)
+    channels = shape[1]
+    np_weight = rng.uniform(0.5, 1.5, size=channels)
+    np_bias = rng.randn(channels)
+    # oneflow keeps epsilon and 1 - momentum as float32 attributes.
+    momentum = 1 - float(np.float32(0.9))
+    eps = float(np.float32(1e-5))
+    torch_x = torch.tensor(np_x, requires_grad=True)
+    torch_weight = torch.tensor(np_weight, requires_grad=True) if affine else None
+    torch_bias = torch.tensor(np_bias, requires_grad=True) if affine else None
+    torch_mean = torch.zeros(channels, dtype=torch.float64)
+    torch_var = torch.ones(channels, dtype=torch.float64)
+    # NHWC data with axis=3 is what oneflow runs for channels_last batch norm.
+    to_flow = (lambda a: a.transpose(0, 2, 3, 1)) if channels_last else (lambda a: a)
+    from_flow = (lambda a: a.transpose(0, 3, 1, 2)) if channels_last else (lambda a: a)
+    x = flow.tensor(to_flow(np_x), device="cuda", requires_grad=True)
+    weight = flow.tensor(np_weight, device="cuda", requires_grad=True) if affine else None
+    bias = flow.tensor(np_bias, device="cuda", requires_grad=True) if affine else None
+    mean = flow.zeros(channels, dtype=flow.float64, device="cuda")
+    var = flow.ones(channels, dtype=flow.float64, device="cuda")
+    for training in [True, False] if track_running_stats else [True]:
+        torch_y = torch.nn.functional.batch_norm(
+            torch_x,
+            torch_mean if track_running_stats else None,
+            torch_var if track_running_stats else None,
+            torch_weight,
+            torch_bias,
+            training=training,
+            momentum=momentum,
+            eps=eps,
+        )
+        y = flow._C.normalization(
+            x,
+            mean if track_running_stats else None,
+            var if track_running_stats else None,
+            weight,
+            bias,
+            3 if channels_last else 1,
+            1e-5,
+            0.1,
+            training,
+        )
+        torch_y.backward(torch.tensor(np_dy))
+        y.backward(flow.tensor(to_flow(np_dy), device="cuda"))
+        pairs = [(from_flow(y.numpy()), torch_y.detach().numpy())]
+        pairs.append((from_flow(x.grad.numpy()), torch_x.grad.numpy()))
+        if affine:
+            pairs.append((weight.grad.numpy(), torch_weight.grad.numpy()))
+            pairs.append((bias.grad.numpy(), torch_bias.grad.numpy()))
+        if track_running_stats:
+            pairs.append((mean.numpy(), torch_mean.numpy()))
+            pairs.append((var.numpy(), torch_var.numpy()))
+        for actual, expected in pairs:
+            test_case.assertTrue(np.allclose(actual, expected, rtol=1e-10, atol=1e-10))
 
 @flow.unittest.skip_unless_1n1d()
 class TestBatchNormModule(flow.unittest.TestCase):
@@ -117,6 +178,19 @@ class TestBatchNormModule(flow.unittest.TestCase):
         x.half()
         y = m(x)
         return y
+
+    @unittest.skipIf(os.getenv("ONEFLOW_TEST_CPU_ONLY"), "only test cuda cases")
+    def test_batchnorm_float64(test_case):
+        arg_dict = OrderedDict()
+        arg_dict["shape"] = [(6, 5), (4, 3, 7), (4, 3, 5, 6), (2, 3, 4, 3, 2)]
+        arg_dict["channels_last"] = [False]
+        arg_dict["affine"] = [True, False]
+        arg_dict["track_running_stats"] = [True, False]
+        for arg in GenArgList(arg_dict):
+            _test_batchnorm_float64(test_case, *arg)
+        # Without gamma and beta the functor sizes them from dim 1, so channels_last needs affine.
+        _test_batchnorm_float64(test_case, (4, 3, 5, 6), True, True, True)
+        _test_batchnorm_float64(test_case, (4, 3, 5, 6), True, True, False)
 
     @profile(torch.nn.functional.batch_norm)
     def profile_batchnorm(test_case):
