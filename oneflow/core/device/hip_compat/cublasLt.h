@@ -493,6 +493,26 @@ inline hipblasStatus_t cublasLtMatmul(hipblasLtHandle_t handle, cublasLtMatmulDe
     alpha = &alpha_f;
     beta = &beta_f;
   }
+  // cuBLASLt treats a null algo as a request for its heuristic's choice. hipBLASLt does not do that
+  // on every GPU: on gfx1100 every double GEMM fails with a null algo. Make the query here.
+  hipblasLtMatmulHeuristicResult_t heuristic;
+  if (algo == nullptr) {
+    hipblasLtMatmulPreference_t pref;
+    status = hipblasLtMatmulPreferenceCreate(&pref);
+    if (status != HIPBLAS_STATUS_SUCCESS) { return status; }
+    uint64_t max_workspace = workspace_size;
+    status = hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                                   &max_workspace, sizeof(max_workspace));
+    int count = 0;
+    if (status == HIPBLAS_STATUS_SUCCESS) {
+      status = hipblasLtMatmulAlgoGetHeuristic(handle, desc->desc, la->layout, lb->layout,
+                                               lc->layout, ld->layout, pref, 1, &heuristic, &count);
+    }
+    hipblasLtMatmulPreferenceDestroy(pref);
+    if (status != HIPBLAS_STATUS_SUCCESS) { return status; }
+    if (count == 0) { return HIPBLAS_STATUS_NOT_SUPPORTED; }
+    algo = &heuristic.algo;
+  }
   status = hipblasLtMatmul(handle, desc->desc, alpha, a, la->layout, b, lb->layout, beta, c,
                            lc->layout, d, ld->layout, algo, workspace, workspace_size, stream);
   if (status != HIPBLAS_STATUS_SUCCESS) { return status; }
