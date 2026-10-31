@@ -264,14 +264,14 @@ inline hipblasStatus_t ApplyDesc(cublasLtMatmulDesc_t d, hipblasLtEpilogue_t epi
                                          sizeof(bias));
 }
 
+// Whether hipBLASLt has a kernel for the epilogue within the workspace the call will be given.
 inline bool NativeAvailable(hipblasLtHandle_t handle, cublasLtMatmulDesc_t d,
                             hipblasLtEpilogue_t epilogue, cublasLtMatrixLayout_t a,
                             cublasLtMatrixLayout_t b, cublasLtMatrixLayout_t c,
-                            cublasLtMatrixLayout_t dl) {
+                            cublasLtMatrixLayout_t dl, uint64_t workspace) {
   if (ApplyDesc(d, epilogue) != HIPBLAS_STATUS_SUCCESS) { return false; }
   hipblasLtMatmulPreference_t pref;
   if (hipblasLtMatmulPreferenceCreate(&pref) != HIPBLAS_STATUS_SUCCESS) { return false; }
-  uint64_t workspace = 64ULL << 20;
   hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace,
                                         sizeof(workspace));
   hipblasLtMatmulHeuristicResult_t result;
@@ -282,13 +282,15 @@ inline bool NativeAvailable(hipblasLtHandle_t handle, cublasLtMatmulDesc_t d,
   return status == HIPBLAS_STATUS_SUCCESS && count > 0;
 }
 
+// The heuristic query and the matmul call must reach the same plan, so both pass the workspace
+// limit the caller uses for the pair (oneflow gives both the stream's cuBLAS workspace size).
 inline Plan MakePlan(hipblasLtHandle_t handle, cublasLtMatmulDesc_t d, cublasLtMatrixLayout_t a,
-                     cublasLtMatrixLayout_t b, cublasLtMatrixLayout_t c,
-                     cublasLtMatrixLayout_t dl) {
+                     cublasLtMatrixLayout_t b, cublasLtMatrixLayout_t c, cublasLtMatrixLayout_t dl,
+                     uint64_t workspace) {
   Plan plan;
   const hipblasLtEpilogue_t e = d->epilogue;
   auto native_or = [&](hipblasLtEpilogue_t native) {
-    return NativeAvailable(handle, d, native, a, b, c, dl);
+    return NativeAvailable(handle, d, native, a, b, c, dl, workspace);
   };
   switch (e) {
     case HIPBLASLT_EPILOGUE_DEFAULT: break;
@@ -459,8 +461,14 @@ inline hipblasStatus_t cublasLtMatmulAlgoGetHeuristic(
     cublasLtMatrixLayout_t b, cublasLtMatrixLayout_t c, cublasLtMatrixLayout_t d,
     hipblasLtMatmulPreference_t pref, int requested, hipblasLtMatmulHeuristicResult_t* results,
     int* returned) {
-  const oneflow_hip_cublaslt::Plan plan = oneflow_hip_cublaslt::MakePlan(handle, desc, a, b, c, d);
-  const hipblasStatus_t status = oneflow_hip_cublaslt::ApplyDesc(desc, plan.native);
+  uint64_t workspace = 0;
+  size_t written = 0;
+  hipblasStatus_t status = hipblasLtMatmulPreferenceGetAttribute(
+      pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace, sizeof(workspace), &written);
+  if (status != HIPBLAS_STATUS_SUCCESS) { return status; }
+  const oneflow_hip_cublaslt::Plan plan =
+      oneflow_hip_cublaslt::MakePlan(handle, desc, a, b, c, d, workspace);
+  status = oneflow_hip_cublaslt::ApplyDesc(desc, plan.native);
   if (status != HIPBLAS_STATUS_SUCCESS) { return status; }
   return hipblasLtMatmulAlgoGetHeuristic(handle, desc->desc, a->layout, b->layout, c->layout,
                                          d->layout, pref, requested, results, returned);
@@ -473,7 +481,7 @@ inline hipblasStatus_t cublasLtMatmul(hipblasLtHandle_t handle, cublasLtMatmulDe
                                       cublasLtMatrixLayout_t ld, const hipblasLtMatmulAlgo_t* algo,
                                       void* workspace, size_t workspace_size, hipStream_t stream) {
   using namespace oneflow_hip_cublaslt;
-  const Plan plan = MakePlan(handle, desc, la, lb, lc, ld);
+  const Plan plan = MakePlan(handle, desc, la, lb, lc, ld, workspace_size);
   hipblasStatus_t status = ApplyDesc(desc, plan.native);
   if (status != HIPBLAS_STATUS_SUCCESS) { return status; }
   float alpha_f = 0.f;
