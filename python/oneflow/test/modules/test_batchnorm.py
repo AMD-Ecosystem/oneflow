@@ -191,6 +191,11 @@ class TestBatchNormModule(flow.unittest.TestCase):
         # Without gamma and beta the functor sizes them from dim 1, so channels_last needs affine.
         _test_batchnorm_float64(test_case, (4, 3, 5, 6), True, True, True)
         _test_batchnorm_float64(test_case, (4, 3, 5, 6), True, True, False)
+        # Reductions longer than a 256-thread block, and more parameter slots (70000
+        # per-activation features) than a launch has blocks.
+        for shape in [(8, 3, 16, 16), (600, 700), (3, 70000)]:
+            _test_batchnorm_float64(test_case, shape, False, True, True)
+        _test_batchnorm_float64(test_case, (8, 3, 16, 16), True, True, True)
 
     @profile(torch.nn.functional.batch_norm)
     def profile_batchnorm(test_case):
