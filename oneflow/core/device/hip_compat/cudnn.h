@@ -43,6 +43,7 @@ limitations under the License.
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -964,11 +965,39 @@ typedef miopenBatchNormMode_t cudnnBatchNormMode_t;
 
 // MIOpen has no double batch norm (it finds no solver), and its derived parameter descriptor is
 // always float. For double tensors the derived descriptor is double, as on cuDNN, and the batch
-// norm calls run on the kernels below. They are only compiled in HIP-language translation units,
-// which are the only callers.
+// norm calls run on the kernels below. MIOpen also refuses training when every parameter slot
+// normalizes a single value (N * H * W == 1 in spatial mode, N == 1 per activation), which cuDNN
+// computes; those calls run on the same kernels for every type. They are only compiled in
+// HIP-language translation units, which are the only callers.
 #if defined(__HIPCC__)
 
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
+
 namespace oneflow_hip_cudnn {
+
+// Tensor element type T and the type P of the parameters and the arithmetic: float for the 16-bit
+// types, whose parameter tensors are float, as on cuDNN.
+template<typename T>
+struct BatchNormType {
+  using P = T;
+  __device__ static P Load(T v) { return v; }
+  __device__ static T Store(P v) { return v; }
+};
+
+template<>
+struct BatchNormType<__half> {
+  using P = float;
+  __device__ static P Load(__half v) { return __half2float(v); }
+  __device__ static __half Store(P v) { return __float2half(v); }
+};
+
+template<>
+struct BatchNormType<__hip_bfloat16> {
+  using P = float;
+  __device__ static P Load(__hip_bfloat16 v) { return __bfloat162float(v); }
+  __device__ static __hip_bfloat16 Store(P v) { return __float2bfloat16(v); }
+};
 
 // A 4-D tensor seen as P parameter slots by R reduced elements: spatial mode reduces over N, H and
 // W for each channel, per-activation mode over N for each (C, H, W).
@@ -996,9 +1025,11 @@ inline bool GetBatchNorm4d(miopenTensorDescriptor_t desc, miopenDataType_t* data
 }
 
 inline bool MakeBatchNormLayout(miopenTensorDescriptor_t x_desc, miopenBatchNormMode_t mode,
-                                BatchNormLayout* layout, BatchNormStrides* x_strides) {
-  miopenDataType_t data_type;
-  if (!GetBatchNorm4d(x_desc, &data_type, layout->dims, x_strides->s)) { return false; }
+                                BatchNormLayout* layout, BatchNormStrides* x_strides,
+                                miopenDataType_t* data_type = nullptr) {
+  miopenDataType_t type;
+  if (!GetBatchNorm4d(x_desc, &type, layout->dims, x_strides->s)) { return false; }
+  if (data_type != nullptr) { *data_type = type; }
   const int* d = layout->dims;
   layout->spatial = (mode == miopenBNSpatial);
   layout->p = layout->spatial ? d[1] : static_cast<int64_t>(d[1]) * d[2] * d[3];
@@ -1050,26 +1081,27 @@ __device__ __forceinline__ T BatchNormBlockSum(T v, T* shared) {
   return shared[0];
 }
 
-template<typename T>
+template<typename T, typename P = typename BatchNormType<T>::P>
 __global__ void __launch_bounds__(kBatchNormBlock)
     BatchNormForwardKernel(BatchNormLayout l, BatchNormStrides xs, BatchNormStrides ys, const T* x,
-                           T* y, T beta, const T* scale, const T* bias, bool training, T factor,
-                           T* running_mean, T* running_variance, const T* estimated_mean,
-                           const T* estimated_variance, T epsilon, T* save_mean,
-                           T* save_inv_variance) {
-  __shared__ T shared[kBatchNormBlock];
+                           T* y, P beta, const P* scale, const P* bias, bool training, P factor,
+                           P* running_mean, P* running_variance, const P* estimated_mean,
+                           const P* estimated_variance, P epsilon, P* save_mean,
+                           P* save_inv_variance) {
+  using Type = BatchNormType<T>;
+  __shared__ P shared[kBatchNormBlock];
   for (int64_t p = blockIdx.x; p < l.p; p += gridDim.x) {
-    T mean = 0;
-    T inv_std = 0;
+    P mean = 0;
+    P inv_std = 0;
     if (training) {
-      T sum = 0;
+      P sum = 0;
       for (int64_t r = threadIdx.x; r < l.r; r += kBatchNormBlock) {
-        sum += x[BatchNormOffset(l, xs, p, r)];
+        sum += Type::Load(x[BatchNormOffset(l, xs, p, r)]);
       }
       mean = BatchNormBlockSum(sum, shared) / l.r;
-      T sq = 0;
+      P sq = 0;
       for (int64_t r = threadIdx.x; r < l.r; r += kBatchNormBlock) {
-        const T d = x[BatchNormOffset(l, xs, p, r)] - mean;
+        const P d = Type::Load(x[BatchNormOffset(l, xs, p, r)]) - mean;
         sq += d * d;
       }
       sq = BatchNormBlockSum(sq, shared);
@@ -1081,7 +1113,7 @@ __global__ void __launch_bounds__(kBatchNormBlock)
           running_mean[p] = (1.0 - factor) * running_mean[p] + factor * mean;
         }
         if (running_variance != nullptr) {
-          const T unbiased = sq / (l.r > 1 ? l.r - 1 : 1);
+          const P unbiased = sq / (l.r > 1 ? l.r - 1 : 1);
           running_variance[p] = (1.0 - factor) * running_variance[p] + factor * unbiased;
         }
       }
@@ -1089,32 +1121,32 @@ __global__ void __launch_bounds__(kBatchNormBlock)
       mean = estimated_mean[p];
       inv_std = 1.0 / sqrt(estimated_variance[p] + epsilon);
     }
-    const T a = scale[p] * inv_std;
-    const T b = bias[p] - mean * a;
+    const P a = scale[p] * inv_std;
     for (int64_t r = threadIdx.x; r < l.r; r += kBatchNormBlock) {
       T* out = y + BatchNormOffset(l, ys, p, r);
-      const T v = x[BatchNormOffset(l, xs, p, r)] * a + b;
-      *out = (beta == 0.0) ? v : v + beta * *out;
+      const P v = (Type::Load(x[BatchNormOffset(l, xs, p, r)]) - mean) * a + bias[p];
+      *out = Type::Store((beta == 0) ? v : v + beta * Type::Load(*out));
     }
   }
 }
 
-template<typename T>
+template<typename T, typename P = typename BatchNormType<T>::P>
 __global__ void __launch_bounds__(kBatchNormBlock)
     BatchNormBackwardKernel(BatchNormLayout l, BatchNormStrides xs, BatchNormStrides dys,
-                            BatchNormStrides dxs, const T* x, const T* dy, T* dx, const T* scale,
-                            T* scale_diff, T* bias_diff, const T* saved_mean,
-                            const T* saved_inv_variance) {
-  __shared__ T shared[kBatchNormBlock];
+                            BatchNormStrides dxs, const T* x, const T* dy, T* dx, const P* scale,
+                            P* scale_diff, P* bias_diff, const P* saved_mean,
+                            const P* saved_inv_variance) {
+  using Type = BatchNormType<T>;
+  __shared__ P shared[kBatchNormBlock];
   for (int64_t p = blockIdx.x; p < l.p; p += gridDim.x) {
-    const T mean = saved_mean[p];
-    const T inv_std = saved_inv_variance[p];
-    T sum_dy = 0;
-    T sum_dy_xhat = 0;
+    const P mean = saved_mean[p];
+    const P inv_std = saved_inv_variance[p];
+    P sum_dy = 0;
+    P sum_dy_xhat = 0;
     for (int64_t r = threadIdx.x; r < l.r; r += kBatchNormBlock) {
-      const T g = dy[BatchNormOffset(l, dys, p, r)];
+      const P g = Type::Load(dy[BatchNormOffset(l, dys, p, r)]);
       sum_dy += g;
-      sum_dy_xhat += g * (x[BatchNormOffset(l, xs, p, r)] - mean) * inv_std;
+      sum_dy_xhat += g * (Type::Load(x[BatchNormOffset(l, xs, p, r)]) - mean) * inv_std;
     }
     sum_dy = BatchNormBlockSum(sum_dy, shared);
     sum_dy_xhat = BatchNormBlockSum(sum_dy_xhat, shared);
@@ -1122,13 +1154,13 @@ __global__ void __launch_bounds__(kBatchNormBlock)
       scale_diff[p] = sum_dy_xhat;
       bias_diff[p] = sum_dy;
     }
-    const T a = scale[p] * inv_std;
-    const T mean_dy = sum_dy / l.r;
-    const T mean_dy_xhat = sum_dy_xhat / l.r;
+    const P a = scale[p] * inv_std;
+    const P mean_dy = sum_dy / l.r;
+    const P mean_dy_xhat = sum_dy_xhat / l.r;
     for (int64_t r = threadIdx.x; r < l.r; r += kBatchNormBlock) {
-      const T xhat = (x[BatchNormOffset(l, xs, p, r)] - mean) * inv_std;
-      dx[BatchNormOffset(l, dxs, p, r)] =
-          a * (dy[BatchNormOffset(l, dys, p, r)] - mean_dy - xhat * mean_dy_xhat);
+      const P xhat = (Type::Load(x[BatchNormOffset(l, xs, p, r)]) - mean) * inv_std;
+      dx[BatchNormOffset(l, dxs, p, r)] = Type::Store(
+          a * (Type::Load(dy[BatchNormOffset(l, dys, p, r)]) - mean_dy - xhat * mean_dy_xhat));
     }
   }
 }
@@ -1137,7 +1169,33 @@ inline unsigned int BatchNormGrid(int64_t p) {
   return static_cast<unsigned int>(std::max<int64_t>(1, std::min<int64_t>(p, 65535)));
 }
 
-inline miopenStatus_t BatchNormDoubleForward(miopenHandle_t handle, miopenBatchNormMode_t mode,
+// Whether the call runs on the kernels above rather than on MIOpen.
+inline bool UseNativeBatchNorm(miopenTensorDescriptor_t x_desc, miopenBatchNormMode_t mode,
+                               bool training) {
+  if (IsDoubleScalar(x_desc)) { return true; }
+  BatchNormLayout layout;
+  BatchNormStrides strides;
+  return training && MakeBatchNormLayout(x_desc, mode, &layout, &strides) && layout.r == 1;
+}
+
+template<typename T, typename P = typename BatchNormType<T>::P>
+void LaunchBatchNormForward(hipStream_t stream, const BatchNormLayout& layout,
+                            const BatchNormStrides& xs, const BatchNormStrides& ys, const void* x,
+                            void* y, double beta, const void* scale, const void* bias,
+                            bool training, double factor, void* running_mean,
+                            void* running_variance, const void* estimated_mean,
+                            const void* estimated_variance, double epsilon, void* save_mean,
+                            void* save_inv_variance) {
+  hipLaunchKernelGGL(
+      BatchNormForwardKernel<T>, dim3(BatchNormGrid(layout.p)), dim3(kBatchNormBlock), 0, stream,
+      layout, xs, ys, static_cast<const T*>(x), static_cast<T*>(y), static_cast<P>(beta),
+      static_cast<const P*>(scale), static_cast<const P*>(bias), training, static_cast<P>(factor),
+      static_cast<P*>(running_mean), static_cast<P*>(running_variance),
+      static_cast<const P*>(estimated_mean), static_cast<const P*>(estimated_variance),
+      static_cast<P>(epsilon), static_cast<P*>(save_mean), static_cast<P*>(save_inv_variance));
+}
+
+inline miopenStatus_t BatchNormNativeForward(miopenHandle_t handle, miopenBatchNormMode_t mode,
                                              const void* beta, miopenTensorDescriptor_t x_desc,
                                              const void* x, miopenTensorDescriptor_t y_desc,
                                              void* y, const void* scale, const void* bias,
@@ -1147,20 +1205,67 @@ inline miopenStatus_t BatchNormDoubleForward(miopenHandle_t handle, miopenBatchN
                                              void* save_mean, void* save_inv_variance) {
   BatchNormLayout layout;
   BatchNormStrides xs, ys;
-  if (!MakeBatchNormLayout(x_desc, mode, &layout, &xs)
+  miopenDataType_t data_type;
+  if (!MakeBatchNormLayout(x_desc, mode, &layout, &xs, &data_type)
       || !GetBatchNormStrides(y_desc, layout, &ys)) {
     return miopenStatusBadParm;
   }
   hipStream_t stream = nullptr;
   const miopenStatus_t status = miopenGetStream(handle, &stream);
   if (status != miopenStatusSuccess) { return status; }
-  hipLaunchKernelGGL(
-      BatchNormForwardKernel<double>, dim3(BatchNormGrid(layout.p)), dim3(kBatchNormBlock), 0,
-      stream, layout, xs, ys, static_cast<const double*>(x), static_cast<double*>(y),
-      ReadScalar(beta, true), static_cast<const double*>(scale), static_cast<const double*>(bias),
-      training, factor, static_cast<double*>(running_mean), static_cast<double*>(running_variance),
-      static_cast<const double*>(estimated_mean), static_cast<const double*>(estimated_variance),
-      epsilon, static_cast<double*>(save_mean), static_cast<double*>(save_inv_variance));
+  const double beta_value = ReadScalar(beta, data_type == miopenDouble);
+  auto launch = [&](auto* type) {
+    using T = std::remove_pointer_t<decltype(type)>;
+    LaunchBatchNormForward<T>(stream, layout, xs, ys, x, y, beta_value, scale, bias, training,
+                              factor, running_mean, running_variance, estimated_mean,
+                              estimated_variance, epsilon, save_mean, save_inv_variance);
+  };
+  switch (data_type) {
+    case miopenDouble: launch(static_cast<double*>(nullptr)); break;
+    case miopenFloat: launch(static_cast<float*>(nullptr)); break;
+    case miopenHalf: launch(static_cast<__half*>(nullptr)); break;
+    case miopenBFloat16: launch(static_cast<__hip_bfloat16*>(nullptr)); break;
+    default: return miopenStatusNotImplemented;
+  }
+  return hipGetLastError() == hipSuccess ? miopenStatusSuccess : miopenStatusUnknownError;
+}
+
+inline miopenStatus_t BatchNormNativeBackward(miopenHandle_t handle, miopenBatchNormMode_t mode,
+                                              miopenTensorDescriptor_t x_desc, const void* x,
+                                              miopenTensorDescriptor_t dy_desc, const void* dy,
+                                              miopenTensorDescriptor_t dx_desc, void* dx,
+                                              const void* scale, void* scale_diff, void* bias_diff,
+                                              const void* saved_mean,
+                                              const void* saved_inv_variance) {
+  if (saved_mean == nullptr || saved_inv_variance == nullptr) { return miopenStatusBadParm; }
+  BatchNormLayout layout;
+  BatchNormStrides xs, dys, dxs;
+  miopenDataType_t data_type;
+  if (!MakeBatchNormLayout(x_desc, mode, &layout, &xs, &data_type)
+      || !GetBatchNormStrides(dy_desc, layout, &dys)
+      || !GetBatchNormStrides(dx_desc, layout, &dxs)) {
+    return miopenStatusBadParm;
+  }
+  hipStream_t stream = nullptr;
+  const miopenStatus_t status = miopenGetStream(handle, &stream);
+  if (status != miopenStatusSuccess) { return status; }
+  auto launch = [&](auto* type) {
+    using T = std::remove_pointer_t<decltype(type)>;
+    using P = typename BatchNormType<T>::P;
+    hipLaunchKernelGGL(BatchNormBackwardKernel<T>, dim3(BatchNormGrid(layout.p)),
+                       dim3(kBatchNormBlock), 0, stream, layout, xs, dys, dxs,
+                       static_cast<const T*>(x), static_cast<const T*>(dy), static_cast<T*>(dx),
+                       static_cast<const P*>(scale), static_cast<P*>(scale_diff),
+                       static_cast<P*>(bias_diff), static_cast<const P*>(saved_mean),
+                       static_cast<const P*>(saved_inv_variance));
+  };
+  switch (data_type) {
+    case miopenDouble: launch(static_cast<double*>(nullptr)); break;
+    case miopenFloat: launch(static_cast<float*>(nullptr)); break;
+    case miopenHalf: launch(static_cast<__half*>(nullptr)); break;
+    case miopenBFloat16: launch(static_cast<__hip_bfloat16*>(nullptr)); break;
+    default: return miopenStatusNotImplemented;
+  }
   return hipGetLastError() == hipSuccess ? miopenStatusSuccess : miopenStatusUnknownError;
 }
 
@@ -1190,8 +1295,8 @@ inline cudnnStatus_t cudnnBatchNormalizationForwardTraining(
     double exponential_average_factor, void* running_mean, void* running_variance, double epsilon,
     void* save_mean, void* save_inv_variance) {
   if (!oneflow_hip_cudnn::IsOne(alpha, y_desc)) { return miopenStatusUnsupportedOp; }
-  if (oneflow_hip_cudnn::IsDoubleScalar(x_desc)) {
-    return oneflow_hip_cudnn::BatchNormDoubleForward(
+  if (oneflow_hip_cudnn::UseNativeBatchNorm(x_desc, mode, /*training=*/true)) {
+    return oneflow_hip_cudnn::BatchNormNativeForward(
         handle, mode, beta, x_desc, x, y_desc, y, scale, bias, /*training=*/true,
         exponential_average_factor, running_mean, running_variance, nullptr, nullptr, epsilon,
         save_mean, save_inv_variance);
@@ -1210,8 +1315,8 @@ inline cudnnStatus_t cudnnBatchNormalizationForwardInference(
     void* y, const cudnnTensorDescriptor_t param_desc, const void* scale, const void* bias,
     const void* estimated_mean, const void* estimated_variance, double epsilon) {
   if (!oneflow_hip_cudnn::IsOne(alpha, y_desc)) { return miopenStatusUnsupportedOp; }
-  if (oneflow_hip_cudnn::IsDoubleScalar(x_desc)) {
-    return oneflow_hip_cudnn::BatchNormDoubleForward(
+  if (oneflow_hip_cudnn::UseNativeBatchNorm(x_desc, mode, /*training=*/false)) {
+    return oneflow_hip_cudnn::BatchNormNativeForward(
         handle, mode, beta, x_desc, x, y_desc, y, scale, bias, /*training=*/false, 0.0, nullptr,
         nullptr, estimated_mean, estimated_variance, epsilon, nullptr, nullptr);
   }
@@ -1236,26 +1341,10 @@ inline cudnnStatus_t cudnnBatchNormalizationBackward(
       || !oneflow_hip_cudnn::IsZero(beta_param_diff, dx_desc)) {
     return miopenStatusUnsupportedOp;
   }
-  if (oneflow_hip_cudnn::IsDoubleScalar(x_desc)) {
-    if (saved_mean == nullptr || saved_inv_variance == nullptr) { return miopenStatusBadParm; }
-    oneflow_hip_cudnn::BatchNormLayout layout;
-    oneflow_hip_cudnn::BatchNormStrides xs, dys, dxs;
-    if (!oneflow_hip_cudnn::MakeBatchNormLayout(x_desc, mode, &layout, &xs)
-        || !oneflow_hip_cudnn::GetBatchNormStrides(dy_desc, layout, &dys)
-        || !oneflow_hip_cudnn::GetBatchNormStrides(dx_desc, layout, &dxs)) {
-      return miopenStatusBadParm;
-    }
-    hipStream_t stream = nullptr;
-    const miopenStatus_t status = miopenGetStream(handle, &stream);
-    if (status != miopenStatusSuccess) { return status; }
-    hipLaunchKernelGGL(
-        oneflow_hip_cudnn::BatchNormBackwardKernel<double>,
-        dim3(oneflow_hip_cudnn::BatchNormGrid(layout.p)), dim3(oneflow_hip_cudnn::kBatchNormBlock),
-        0, stream, layout, xs, dys, dxs, static_cast<const double*>(x),
-        static_cast<const double*>(dy), static_cast<double*>(dx), static_cast<const double*>(scale),
-        static_cast<double*>(scale_diff), static_cast<double*>(bias_diff),
-        static_cast<const double*>(saved_mean), static_cast<const double*>(saved_inv_variance));
-    return hipGetLastError() == hipSuccess ? miopenStatusSuccess : miopenStatusUnknownError;
+  if (oneflow_hip_cudnn::UseNativeBatchNorm(x_desc, mode, /*training=*/true)) {
+    return oneflow_hip_cudnn::BatchNormNativeBackward(handle, mode, x_desc, x, dy_desc, dy, dx_desc,
+                                                      dx, scale, scale_diff, bias_diff, saved_mean,
+                                                      saved_inv_variance);
   }
   return miopenBatchNormalizationBackward(handle, mode, alpha_data_diff, beta_data_diff,
                                           alpha_param_diff, beta_param_diff, x_desc, x, dy_desc, dy,
