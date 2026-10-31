@@ -27,7 +27,9 @@ import oneflow as flow
 import oneflow.unittest
 
 
-def _test_batchnorm_float64(test_case, shape, channels_last, affine, track_running_stats):
+def _test_batchnorm_float64(
+    test_case, shape, channels_last, affine, track_running_stats
+):
     import torch
 
     rng = np.random.RandomState(sum(shape))
@@ -48,7 +50,9 @@ def _test_batchnorm_float64(test_case, shape, channels_last, affine, track_runni
     to_flow = (lambda a: a.transpose(0, 2, 3, 1)) if channels_last else (lambda a: a)
     from_flow = (lambda a: a.transpose(0, 3, 1, 2)) if channels_last else (lambda a: a)
     x = flow.tensor(to_flow(np_x), device="cuda", requires_grad=True)
-    weight = flow.tensor(np_weight, device="cuda", requires_grad=True) if affine else None
+    weight = (
+        flow.tensor(np_weight, device="cuda", requires_grad=True) if affine else None
+    )
     bias = flow.tensor(np_bias, device="cuda", requires_grad=True) if affine else None
     mean = flow.zeros(channels, dtype=flow.float64, device="cuda")
     var = flow.ones(channels, dtype=flow.float64, device="cuda")
@@ -86,6 +90,7 @@ def _test_batchnorm_float64(test_case, shape, channels_last, affine, track_runni
             pairs.append((var.numpy(), torch_var.numpy()))
         for actual, expected in pairs:
             test_case.assertTrue(np.allclose(actual, expected, rtol=1e-10, atol=1e-10))
+
 
 @flow.unittest.skip_unless_1n1d()
 class TestBatchNormModule(flow.unittest.TestCase):
