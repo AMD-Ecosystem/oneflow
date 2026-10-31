@@ -18,7 +18,6 @@ limitations under the License.
 #if defined(WITH_CUDA) && defined(USE_HIP)
 
 #include <rpp/rpp.h>
-#include <stdexcept>
 
 namespace oneflow {
 
@@ -29,14 +28,27 @@ struct RppImageResizer::Impl {
   RpptImagePatch* dst_size = nullptr;
 };
 
-RppImageResizer::RppImageResizer(hipStream_t stream) : impl_(new Impl) {
-  if (rppCreate(&impl_->handle, 1, 0, stream, RppBackend::RPP_HIP_BACKEND) != rppStatusSuccess
-      || hipHostMalloc(reinterpret_cast<void**>(&impl_->roi), sizeof(RpptROI)) != hipSuccess
-      || hipHostMalloc(reinterpret_cast<void**>(&impl_->dst_size), sizeof(RpptImagePatch))
-             != hipSuccess) {
-    throw std::runtime_error("failed to set up the RPP image resizer");
+std::unique_ptr<RppImageResizer> RppImageResizer::Create(hipStream_t stream) {
+  // The destructor releases whatever part of the setup succeeded.
+  std::unique_ptr<RppImageResizer> resizer(new RppImageResizer(new Impl));
+  Impl* impl = resizer->impl_;
+  if (rppCreate(&impl->handle, 1, 0, stream, RppBackend::RPP_HIP_BACKEND) != rppStatusSuccess) {
+    impl->handle = nullptr;
+    return nullptr;
   }
+  if (hipHostMalloc(reinterpret_cast<void**>(&impl->roi), sizeof(RpptROI)) != hipSuccess) {
+    impl->roi = nullptr;
+    return nullptr;
+  }
+  if (hipHostMalloc(reinterpret_cast<void**>(&impl->dst_size), sizeof(RpptImagePatch))
+      != hipSuccess) {
+    impl->dst_size = nullptr;
+    return nullptr;
+  }
+  return resizer;
 }
+
+RppImageResizer::RppImageResizer(Impl* impl) : impl_(impl) {}
 
 RppImageResizer::~RppImageResizer() {
   if (impl_->handle != nullptr) { (void)rppDestroy(impl_->handle, RppBackend::RPP_HIP_BACKEND); }

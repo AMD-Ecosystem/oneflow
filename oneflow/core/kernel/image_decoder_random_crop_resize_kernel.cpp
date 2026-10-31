@@ -498,7 +498,9 @@ DecodeHandleFactory CreateDecodeHandleFactory<DeviceType::kCUDA>(int target_widt
 
 // The hardware decoder writes the whole image as interleaved RGB; the random crop is applied by the
 // resize, the same order the nvJPEG path uses with its hardware decoder. Streams the decoder does
-// not support (progressive JPEG, for example) go to the CPU decoder.
+// not support (progressive JPEG, for example) go to the CPU decoder, and so does every image when
+// no hardware decoder can be created (a GPU without a JPEG engine, or no access to its driver) or
+// when ONEFLOW_DECODER_ENABLE_NVJPEG_HARDWARE_ACCELERATION is false.
 class GpuDecodeHandle final : public DecodeHandle {
  public:
   OF_DISALLOW_COPY_AND_MOVE(GpuDecodeHandle);
@@ -533,9 +535,28 @@ class GpuDecodeHandle final : public DecodeHandle {
 GpuDecodeHandle::GpuDecodeHandle(int dev, int target_width, int target_height)
     : warmup_done_(false) {
   OF_CUDA_CHECK(cudaStreamCreateWithFlags(&cuda_stream_, cudaStreamNonBlocking));
-  OF_ROCJPEG_CHECK(rocJpegCreate(ROCJPEG_BACKEND_HARDWARE, dev, &jpeg_handle_));
-  OF_ROCJPEG_CHECK(rocJpegStreamCreate(&jpeg_stream_));
-  resizer_.reset(new RppImageResizer(cuda_stream_));
+  if (!ParseBooleanFromEnv("ONEFLOW_DECODER_ENABLE_NVJPEG_HARDWARE_ACCELERATION", true)) {
+    LOG(WARNING) << "ONEFLOW_DECODER_ENABLE_NVJPEG_HARDWARE_ACCELERATION is false, JPEG images are "
+                    "decoded on the CPU";
+  } else {
+    const RocJpegStatus status = rocJpegCreate(ROCJPEG_BACKEND_HARDWARE, dev, &jpeg_handle_);
+    if (status != ROCJPEG_STATUS_SUCCESS) {
+      jpeg_handle_ = nullptr;
+      LOG(WARNING) << "rocJPEG cannot create a hardware JPEG decoder on device " << dev << " ("
+                   << rocJpegGetErrorName(status) << "), JPEG images are decoded on the CPU";
+    } else {
+      OF_ROCJPEG_CHECK(rocJpegStreamCreate(&jpeg_stream_));
+      resizer_ = RppImageResizer::Create(cuda_stream_);
+      if (!resizer_) {
+        LOG(WARNING) << "RPP cannot be set up on device " << dev
+                     << ", JPEG images are decoded on the CPU";
+        OF_ROCJPEG_CHECK(rocJpegStreamDestroy(jpeg_stream_));
+        OF_ROCJPEG_CHECK(rocJpegDestroy(jpeg_handle_));
+        jpeg_stream_ = nullptr;
+        jpeg_handle_ = nullptr;
+      }
+    }
+  }
   fallback_buffer_size_ = target_width * target_height * kNumChannels;
   OF_CUDA_CHECK(cudaMallocHost(&fallback_buffer_, fallback_buffer_size_));
 }
@@ -543,14 +564,17 @@ GpuDecodeHandle::GpuDecodeHandle(int dev, int target_width, int target_height)
 GpuDecodeHandle::~GpuDecodeHandle() {
   OF_CUDA_CHECK(cudaStreamSynchronize(cuda_stream_));
   resizer_.reset();
-  OF_ROCJPEG_CHECK(rocJpegStreamDestroy(jpeg_stream_));
-  OF_ROCJPEG_CHECK(rocJpegDestroy(jpeg_handle_));
+  if (jpeg_handle_ != nullptr) {
+    OF_ROCJPEG_CHECK(rocJpegStreamDestroy(jpeg_stream_));
+    OF_ROCJPEG_CHECK(rocJpegDestroy(jpeg_handle_));
+  }
   OF_CUDA_CHECK(cudaStreamDestroy(cuda_stream_));
   OF_CUDA_CHECK(cudaFreeHost(fallback_buffer_));
 }
 
 bool GpuDecodeHandle::Decode(const unsigned char* data, size_t length, unsigned char* dst,
                              size_t dst_max_length, int* dst_width, int* dst_height) {
+  if (jpeg_handle_ == nullptr) { return false; }
   if (rocJpegStreamParse(data, length, jpeg_stream_) != ROCJPEG_STATUS_SUCCESS) { return false; }
   uint8_t num_components = 0;
   RocJpegChromaSubsampling subsampling{};
@@ -612,7 +636,7 @@ void GpuDecodeHandle::DecodeRandomCropResize(const unsigned char* data, size_t l
 }
 
 void GpuDecodeHandle::WarmupOnce(int warmup_size, unsigned char* workspace, size_t workspace_size) {
-  if (warmup_done_) { return; }
+  if (warmup_done_ || jpeg_handle_ == nullptr) { return; }
   warmup_size = std::min(static_cast<int>(std::sqrt(workspace_size / kNumChannels)), warmup_size);
   cv::Mat image = cv::Mat::zeros(cv::Size(warmup_size, warmup_size), CV_8UC3);
   cv::randu(image, cv::Scalar(0, 0, 0), cv::Scalar(255, 255, 255));
@@ -795,6 +819,6 @@ NEW_REGISTER_KERNEL(OperatorConf::kImageDecoderRandomCropResizeConf,
       return conf.op_attribute().op_conf().device_tag() == "cuda";
     });
 
-#endif  // defined(WITH_NVJPEG)
+#endif  // defined(WITH_NVJPEG) || defined(WITH_ROCJPEG)
 
 }  // namespace oneflow

@@ -19,6 +19,7 @@ limitations under the License.
 #if defined(WITH_CUDA) && defined(USE_HIP)
 
 #include <hip/hip_runtime.h>
+#include <memory>
 
 namespace oneflow {
 
@@ -27,7 +28,8 @@ namespace oneflow {
 // named BILINEAR, so rpp.h cannot be included next to the cuDNN headers.
 class RppImageResizer final {
  public:
-  explicit RppImageResizer(hipStream_t stream);
+  // Returns nullptr if RPP cannot be set up on the stream.
+  static std::unique_ptr<RppImageResizer> Create(hipStream_t stream);
   ~RppImageResizer();
   RppImageResizer(const RppImageResizer&) = delete;
   RppImageResizer& operator=(const RppImageResizer&) = delete;
@@ -38,6 +40,7 @@ class RppImageResizer final {
 
  private:
   struct Impl;
+  explicit RppImageResizer(Impl* impl);
   Impl* impl_;
 };
 
