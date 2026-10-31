@@ -5,6 +5,10 @@ Licensed under the Apache License, Version 2.0 (the "License").
 #pragma once
 #include "oneflow/core/device/cuda_to_hip.h"
 #include <hipblas/hipblas.h>
+#include <hipblaslt/hipblaslt.h>
+#include <algorithm>
+#include <cstdint>
+#include <utility>
 
 // cuBLAS keeps C++ overloads of cublasGemmEx, cublasGemmBatchedEx and cublasGemmStridedBatchedEx
 // that take the compute type as a data type (the signatures from before cublasComputeType_t
@@ -55,4 +59,83 @@ inline hipblasStatus_t hipblasGemmStridedBatchedEx(
   return hipblasGemmStridedBatchedEx(handle, transA, transB, m, n, k, alpha, A, aType, lda, strideA,
                                      B, bType, ldb, strideB, beta, C, cType, ldc, strideC,
                                      batchCount, compute_type, algo);
+}
+
+// rocBLAS gemm_ex splits k into chunks once ld * k of either operand reaches 2^30 and adds each
+// chunk's product into D, so a 16-bit D is rounded once per chunk (about 1025 times for k = 2^20)
+// and the error grows with k. hipBLASLt accumulates the whole product in float and rounds once
+// (it is also much faster on these shapes), so callers send such GEMMs to OfHipblasLtGemm instead.
+inline bool OfRocblasSplitsK(hipDataType d_type, int64_t k, int64_t lda, int64_t ldb) {
+  return (d_type == HIP_R_16F || d_type == HIP_R_16BF)
+         && std::max(lda, ldb) * k >= (int64_t{1} << 30);
+}
+
+// Column-major strided batched D = alpha * op(A) * op(B) + beta * D with float compute.
+inline hipblasStatus_t OfHipblasLtGemm(hipblasLtHandle_t handle, hipStream_t stream,
+                                       void* workspace, size_t workspace_size,
+                                       hipblasOperation_t trans_a, hipblasOperation_t trans_b,
+                                       int64_t m, int64_t n, int64_t k, float alpha, const void* a,
+                                       int64_t lda, int64_t stride_a, const void* b, int64_t ldb,
+                                       int64_t stride_b, float beta, void* d, hipDataType type,
+                                       int64_t ldd, int64_t stride_d, int64_t batch_count) {
+  hipblasLtMatmulDesc_t desc = nullptr;
+  hipblasLtMatrixLayout_t layout_a = nullptr;
+  hipblasLtMatrixLayout_t layout_b = nullptr;
+  hipblasLtMatrixLayout_t layout_d = nullptr;
+  hipblasLtMatmulPreference_t pref = nullptr;
+  const bool ta = trans_a != HIPBLAS_OP_N;
+  const bool tb = trans_b != HIPBLAS_OP_N;
+  const int32_t batch = static_cast<int32_t>(batch_count);
+  const uint64_t max_workspace = workspace_size;
+  hipblasLtMatmulHeuristicResult_t heuristic{};
+  int count = 0;
+  hipblasStatus_t status = hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_32F, HIP_R_32F);
+  const auto Step = [&status](auto&& f) {
+    if (status == HIPBLAS_STATUS_SUCCESS) { status = f(); }
+  };
+  Step([&] {
+    return hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSA, &trans_a,
+                                           sizeof(trans_a));
+  });
+  Step([&] {
+    return hipblasLtMatmulDescSetAttribute(desc, HIPBLASLT_MATMUL_DESC_TRANSB, &trans_b,
+                                           sizeof(trans_b));
+  });
+  Step([&] { return hipblasLtMatrixLayoutCreate(&layout_a, type, ta ? k : m, ta ? m : k, lda); });
+  Step([&] { return hipblasLtMatrixLayoutCreate(&layout_b, type, tb ? n : k, tb ? k : n, ldb); });
+  Step([&] { return hipblasLtMatrixLayoutCreate(&layout_d, type, m, n, ldd); });
+  const std::pair<hipblasLtMatrixLayout_t, int64_t> strided[] = {
+      {layout_a, stride_a}, {layout_b, stride_b}, {layout_d, stride_d}};
+  for (const auto& layout : strided) {
+    if (batch_count == 1) { break; }
+    Step([&] {
+      return hipblasLtMatrixLayoutSetAttribute(layout.first, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+                                               &batch, sizeof(batch));
+    });
+    Step([&] {
+      return hipblasLtMatrixLayoutSetAttribute(layout.first,
+                                               HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                                               &layout.second, sizeof(layout.second));
+    });
+  }
+  Step([&] { return hipblasLtMatmulPreferenceCreate(&pref); });
+  Step([&] {
+    return hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                                 &max_workspace, sizeof(max_workspace));
+  });
+  Step([&] {
+    return hipblasLtMatmulAlgoGetHeuristic(handle, desc, layout_a, layout_b, layout_d, layout_d,
+                                           pref, 1, &heuristic, &count);
+  });
+  Step([&] { return count == 0 ? HIPBLAS_STATUS_NOT_SUPPORTED : HIPBLAS_STATUS_SUCCESS; });
+  Step([&] {
+    return hipblasLtMatmul(handle, desc, &alpha, a, layout_a, b, layout_b, &beta, d, layout_d, d,
+                           layout_d, &heuristic.algo, workspace, workspace_size, stream);
+  });
+  if (pref != nullptr) { hipblasLtMatmulPreferenceDestroy(pref); }
+  if (layout_d != nullptr) { hipblasLtMatrixLayoutDestroy(layout_d); }
+  if (layout_b != nullptr) { hipblasLtMatrixLayoutDestroy(layout_b); }
+  if (layout_a != nullptr) { hipblasLtMatrixLayoutDestroy(layout_a); }
+  if (desc != nullptr) { hipblasLtMatmulDescDestroy(desc); }
+  return status;
 }
