@@ -1286,6 +1286,17 @@ class PixelShuffleFunctor {
   }
 };
 
+// The channels_last 2D pooling path below runs on cuDNN, which takes every floating type. On ROCm
+// it runs on MIOpen, which has no double pooling; those inputs take the channels_first kernels on
+// an NCHW view instead.
+inline bool PoolingLibrarySupportsDataType(DataType data_type) {
+#ifdef USE_HIP
+  return data_type == DataType::kFloat || data_type == DataType::kFloat16;
+#else
+  return true;
+#endif
+}
+
 class TFPoolNDFunctor {
  public:
   TFPoolNDFunctor() = default;
@@ -1321,6 +1332,15 @@ class MaxPoolNDFunctor {
     // channels_last case
     if (input->is_cuda() && num_spatial_dims_ == 2 && data_format == "channels_last") {
       if (!return_indices && dilation.at(0) == 1 && dilation.at(1) == 1) {
+        if (!PoolingLibrarySupportsDataType(input->dtype()->data_type())) {
+          const auto& nchw = JUST(functional::Permute(input, {0, 3, 1, 2}));
+          const auto& pooled = JUST((*this)(nchw, kernel_size, stride, padding, dilation,
+                                            return_indices, ceil_mode, "channels_first"));
+          TensorTuple output;
+          output.emplace_back(JUST(
+              functional::ToContiguous(JUST(functional::Permute(pooled->at(0), {0, 2, 3, 1})))));
+          return output;
+        }
         // legacy tf style maxpool2d , use cudnn implementation
         // with high performance but do not support dilation/return_indices
         std::vector<int32_t> padding_before{padding.at(0), padding.at(1)};
@@ -1391,6 +1411,14 @@ class AvgPoolNDFunctor {
           << "AvgPool2d with channels_last data format don't support count_include_pad for now.";
       CHECK_EQ_OR_THROW(divisor_override, 0)
           << "AvgPool2d with channels_last data format don't support divisor_override for now.";
+      if (!PoolingLibrarySupportsDataType(x->dtype()->data_type())) {
+        // The library path averages over the window inside the input, so exclude the padding.
+        const auto& nchw = JUST(functional::Permute(x, {0, 3, 1, 2}));
+        const auto& pooled =
+            JUST((*this)(nchw, kernel_size, stride, padding, ceil_mode,
+                         /*count_include_pad=*/false, divisor_override, "channels_first"));
+        return functional::ToContiguous(JUST(functional::Permute(pooled, {0, 2, 3, 1})));
+      }
 
       std::vector<int32_t> padding_before{JUST(VectorAt(padding, 0)), JUST(VectorAt(padding, 1))};
       std::vector<int32_t> padding_after{JUST(VectorAt(padding, 0)), JUST(VectorAt(padding, 1))};
