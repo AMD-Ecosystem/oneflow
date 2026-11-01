@@ -47,9 +47,6 @@ __global__ void StoreTile(int64_t rows, int64_t cols, const float* tile, float b
   }
 }
 
-// Floats in a tile of D, so the fallback needs at most 4 MiB.
-constexpr int64_t kMaxTileSize = int64_t{1} << 20;
-
 // rocBLAS gemm_ex with a float D accumulates the k-chunks in float. D goes through a float tile of
 // tile_size elements in pieces.
 template<typename T>
@@ -107,9 +104,13 @@ hipblasStatus_t OfLongKGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle,
     if (status != HIPBLAS_STATUS_NOT_SUPPORTED) { return status; }
   }
   if (type != HIP_R_16F && type != HIP_R_16BF) { return HIPBLAS_STATUS_NOT_SUPPORTED; }
-  // The tile is the workspace when it is large enough (rocBLAS does not use it) and a temporary
+  // A float tile of at most ONEFLOW_EP_CUDA_LONG_K_GEMM_MAX_TILE_SIZE elements (4 MiB by default).
+  // It is the workspace when that is large enough (rocBLAS does not use it) and a temporary
   // allocation otherwise, never a rocBLAS call with the 16-bit D.
-  const int64_t tile_size = std::min(m * n, kMaxTileSize);
+  const int64_t max_tile_size = std::max<int64_t>(
+      1,
+      oneflow::ParseIntegerFromEnv("ONEFLOW_EP_CUDA_LONG_K_GEMM_MAX_TILE_SIZE", int64_t{1} << 20));
+  const int64_t tile_size = std::min(m * n, max_tile_size);
   void* tile = workspace;
   if (workspace_size < tile_size * sizeof(float)) {
     tile = nullptr;

@@ -90,6 +90,31 @@ def _check_all(test_case):
         _check_grouped(test_case, problems, False)
 
 
+def _check_row_tiles(test_case):
+    # With 2^15-float tiles, outputs with 40000 cuBLAS rows (columns of the oneflow output) take
+    # one full and one partial tile per column. Every input stays below 2^31 elements.
+    gen = flow.Generator(device="cuda")
+    gen.manual_seed(0)
+    rand = lambda *s: flow.rand(*s, device="cuda", generator=gen) * 2 - 1
+    k, n = 1 << 15, 40000
+    cases = [
+        ((3, k), (k, n), {}, "matmul"),
+        ((3, k), (n, k), {"transpose_b": True}, "matmul transpose_b"),
+        ((k, 3), (k, n), {"transpose_a": True}, "matmul transpose_a"),
+        ((2, k, 3), (k, n), {"transpose_a": True}, "broadcast transpose_a"),
+    ]
+    for dtype in [flow.float16, flow.bfloat16]:
+        for a, b, kwargs, desc in cases:
+            fa, fb = rand(*a).to(dtype), rand(*b).to(dtype)
+            out = flow.matmul(fa, fb, **kwargs)
+            test_case.assertEqual(out.dtype, dtype)
+            # The reference multiplies exactly the values the kernel sees.
+            ref = flow.matmul(fa.to(flow.float32), fb.to(flow.float32), **kwargs)
+            err = ((out.to(flow.float32) - ref).abs().max() / ref.abs().max()).item()
+            tol = 4 * 2.0 ** -_SIGNIFICAND_BITS[dtype]
+            test_case.assertLess(err, tol, "%s, rows in pieces %s" % (desc, dtype))
+
+
 @contextlib.contextmanager
 def _env(name, value):
     old = os.environ.get(name)
@@ -124,6 +149,8 @@ class TestMatmulLongK(flow.unittest.TestCase):
                 lambda x, y: flow.matmul(x, y, transpose_b=True),
                 "matmul transpose_b, output in pieces",
             )
+            with _env("ONEFLOW_EP_CUDA_LONG_K_GEMM_MAX_TILE_SIZE", str(1 << 15)):
+                _check_row_tiles(test_case)
 
     def test_matmul_long_k_without_workspace(test_case):
         # With no cuBLAS workspace the float tiles of the fallback need their own memory. A stream
