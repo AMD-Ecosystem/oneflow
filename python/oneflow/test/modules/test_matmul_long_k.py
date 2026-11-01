@@ -95,6 +95,18 @@ def _check_all(test_case):
     problems = [(1, 16, _K), (3, 8, _K)]
     _check_grouped(test_case, problems, True)
     _check_grouped(test_case, problems, False)
+    # Shorter k, including one that is not a multiple of 2^15.
+    for k in [163840, 200000, 1 << 18]:
+        for dtype in [flow.float16, flow.bfloat16]:
+            _check(
+                test_case,
+                dtype,
+                (2, k),
+                (16, k),
+                lambda x, y: flow.matmul(x, y, transpose_b=True),
+                "matmul transpose_b k=%d" % k,
+            )
+        _check_grouped(test_case, [(3, 8, k)], False)
     # Empty outputs: a weight or an input without rows.
     for problems in [[(2, 0, _K)], [(0, 2, _K)]]:
         _check_grouped(test_case, problems, False)

@@ -75,23 +75,16 @@ inline bool OfUseLongKGemm(hipDataType d_type, int64_t k, int64_t lda, int64_t l
              || (k > kOfLongKGemmChain && OfMatrixCoreAccumulationDrifts()));
 }
 
-// Column-major strided batched D = alpha * op(A) * op(B) + beta * D with float compute. With
-// split_k > 1, k is split into that many partial products, summed in float.
-hipblasStatus_t OfHipblasLtSplitKGemm(hipblasLtHandle_t handle, hipStream_t stream, void* workspace,
-                                      size_t workspace_size, hipblasLtMatmulDesc_t desc,
-                                      hipblasLtMatrixLayout_t layout_a,
-                                      hipblasLtMatrixLayout_t layout_b,
-                                      hipblasLtMatrixLayout_t layout_d,
-                                      hipblasLtMatmulPreference_t pref, float alpha, const void* a,
-                                      const void* b, float beta, void* d, int64_t split_k);
+// Column-major strided batched D = alpha * op(A) * op(B) + beta * D with float compute, A and B of
+// the given type and D of d_type.
 inline hipblasStatus_t OfHipblasLtGemm(hipblasLtHandle_t handle, hipStream_t stream,
                                        void* workspace, size_t workspace_size,
                                        hipblasOperation_t trans_a, hipblasOperation_t trans_b,
                                        int64_t m, int64_t n, int64_t k, float alpha, const void* a,
                                        int64_t lda, int64_t stride_a, const void* b, int64_t ldb,
                                        int64_t stride_b, float beta, void* d, hipDataType type,
-                                       int64_t ldd, int64_t stride_d, int64_t batch_count,
-                                       int64_t split_k) {
+                                       hipDataType d_type, int64_t ldd, int64_t stride_d,
+                                       int64_t batch_count) {
   hipblasLtMatmulDesc_t desc = nullptr;
   hipblasLtMatrixLayout_t layout_a = nullptr;
   hipblasLtMatrixLayout_t layout_b = nullptr;
@@ -117,7 +110,7 @@ inline hipblasStatus_t OfHipblasLtGemm(hipblasLtHandle_t handle, hipStream_t str
   });
   Step([&] { return hipblasLtMatrixLayoutCreate(&layout_a, type, ta ? k : m, ta ? m : k, lda); });
   Step([&] { return hipblasLtMatrixLayoutCreate(&layout_b, type, tb ? n : k, tb ? k : n, ldb); });
-  Step([&] { return hipblasLtMatrixLayoutCreate(&layout_d, type, m, n, ldd); });
+  Step([&] { return hipblasLtMatrixLayoutCreate(&layout_d, d_type, m, n, ldd); });
   const std::pair<hipblasLtMatrixLayout_t, int64_t> strided[] = {
       {layout_a, stride_a}, {layout_b, stride_b}, {layout_d, stride_d}};
   for (const auto& layout : strided) {
@@ -137,23 +130,16 @@ inline hipblasStatus_t OfHipblasLtGemm(hipblasLtHandle_t handle, hipStream_t str
     return hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                                  &max_workspace, sizeof(max_workspace));
   });
-  if (split_k > 1) {
-    Step([&] {
-      return OfHipblasLtSplitKGemm(handle, stream, workspace, workspace_size, desc, layout_a,
-                                   layout_b, layout_d, pref, alpha, a, b, beta, d, split_k);
-    });
-  } else {
-    Step([&] {
-      const hipblasStatus_t found = hipblasLtMatmulAlgoGetHeuristic(
-          handle, desc, layout_a, layout_b, layout_d, layout_d, pref, 1, &heuristic, &count);
-      return found != HIPBLAS_STATUS_SUCCESS || count == 0 ? HIPBLAS_STATUS_NOT_SUPPORTED
-                                                           : HIPBLAS_STATUS_SUCCESS;
-    });
-    Step([&] {
-      return hipblasLtMatmul(handle, desc, &alpha, a, layout_a, b, layout_b, &beta, d, layout_d, d,
-                             layout_d, &heuristic.algo, workspace, workspace_size, stream);
-    });
-  }
+  Step([&] {
+    const hipblasStatus_t found = hipblasLtMatmulAlgoGetHeuristic(
+        handle, desc, layout_a, layout_b, layout_d, layout_d, pref, 1, &heuristic, &count);
+    return found != HIPBLAS_STATUS_SUCCESS || count == 0 ? HIPBLAS_STATUS_NOT_SUPPORTED
+                                                         : HIPBLAS_STATUS_SUCCESS;
+  });
+  Step([&] {
+    return hipblasLtMatmul(handle, desc, &alpha, a, layout_a, b, layout_b, &beta, d, layout_d, d,
+                           layout_d, &heuristic.algo, workspace, workspace_size, stream);
+  });
   if (pref != nullptr) { hipblasLtMatmulPreferenceDestroy(pref); }
   if (layout_d != nullptr) { hipblasLtMatrixLayoutDestroy(layout_d); }
   if (layout_b != nullptr) { hipblasLtMatrixLayoutDestroy(layout_b); }
@@ -162,8 +148,9 @@ inline hipblasStatus_t OfHipblasLtGemm(hipblasLtHandle_t handle, hipStream_t str
   return status;
 }
 
-// The GEMM OfUseLongKGemm selects: OfHipblasLtGemm, or, when hipBLASLt has no algorithm for the
-// shape (or ONEFLOW_EP_CUDA_LONG_K_GEMM_USE_HIPBLASLT=0), rocBLAS with a float D in tiles,
+// The GEMM OfUseLongKGemm selects: OfHipblasLtGemm (where the accumulator drifts, on k-chunks of
+// at most kOfLongKGemmChain with float partial products), or, when hipBLASLt has no algorithm for
+// the shape (or ONEFLOW_EP_CUDA_LONG_K_GEMM_USE_HIPBLASLT=0), rocBLAS with a float D in tiles,
 // rounded to the 16-bit D once.
 hipblasStatus_t OfLongKGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle, hipStream_t stream,
                             void* workspace, size_t workspace_size, hipblasOperation_t trans_a,
