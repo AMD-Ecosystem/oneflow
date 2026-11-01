@@ -101,10 +101,10 @@ void CublasBatchGemm<half>(ep::CudaStream* stream, char transa, char transb, int
     cudaDataType_t comp_type = CudaDataTypeTrait<comp_t>::value;
 #if defined(USE_HIP)
     if (OfRocblasSplitsK(data_type, k, lda, ldb)) {
-      OF_CUBLAS_CHECK(OfHipblasLtGemm(stream->cublas_lt_handle(), stream->cuda_stream(),
-                                      stream->cublas_workspace(), stream->cublas_workspace_size(),
-                                      opa, opb, m, n, k, alpha_f, a, lda, stridea, b, ldb, strideb,
-                                      beta_f, c, data_type, ldc, stridec, batch_size));
+      OF_CUBLAS_CHECK(OfLongKGemm(
+          stream->cublas_handle(), stream->cublas_lt_handle(), stream->cuda_stream(),
+          stream->cublas_workspace(), stream->cublas_workspace_size(), opa, opb, m, n, k, alpha_f,
+          a, lda, stridea, b, ldb, strideb, beta_f, c, data_type, ldc, stridec, batch_size));
       return;
     }
 #endif  // defined(USE_HIP)

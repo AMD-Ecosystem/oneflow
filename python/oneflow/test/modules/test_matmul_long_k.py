@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+import contextlib
 import os
 import unittest
 
@@ -63,25 +64,58 @@ def _check_grouped(test_case, problems, bias):
         test_case.assertLess(err, tol, "grouped %s bias=%s" % (problems[i], bias))
 
 
+def _check_all(test_case):
+    for dtype in [flow.float16, flow.bfloat16]:
+        _check(test_case, dtype, (2, _K), (_K, 16), flow.matmul, "matmul")
+        _check(
+            test_case,
+            dtype,
+            (2, _K),
+            (16, _K),
+            lambda x, y: flow.matmul(x, y, transpose_b=True),
+            "matmul transpose_b",
+        )
+        _check(test_case, dtype, (2, 1, _K), (2, _K, 16), flow.bmm, "bmm")
+        _check(test_case, dtype, (1, _K), (2, _K, 16), flow.matmul, "broadcast")
+    problems = [(1, 16, _K), (3, 8, _K)]
+    _check_grouped(test_case, problems, True)
+    _check_grouped(test_case, problems, False)
+
+
+@contextlib.contextmanager
+def _env(name, value):
+    old = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if old is None:
+            del os.environ[name]
+        else:
+            os.environ[name] = old
+
+
 @flow.unittest.skip_unless_1n1d()
 @unittest.skipIf(os.getenv("ONEFLOW_TEST_CPU_ONLY"), "only test cpu cases")
 class TestMatmulLongK(flow.unittest.TestCase):
     def test_matmul_long_k(test_case):
-        for dtype in [flow.float16, flow.bfloat16]:
-            _check(test_case, dtype, (2, _K), (_K, 16), flow.matmul, "matmul")
+        _check_all(test_case)
+
+    def test_matmul_long_k_without_hipblaslt(test_case):
+        # On ROCm, the path taken when hipBLASLt has no algorithm for a shape. Elsewhere the
+        # variable has no effect.
+        with _env("ONEFLOW_EP_CUDA_LONG_K_GEMM_USE_HIPBLASLT", "0"):
+            _check_all(test_case)
+            # An output larger than the default 4 MiB workspace holds as float, so the
+            # product goes through it in two pieces.
             _check(
                 test_case,
-                dtype,
-                (2, _K),
-                (16, _K),
+                flow.float16,
+                (640, 1 << 15),
+                (2048, 1 << 15),
                 lambda x, y: flow.matmul(x, y, transpose_b=True),
-                "matmul transpose_b",
+                "matmul transpose_b, output in pieces",
             )
-            _check(test_case, dtype, (2, 1, _K), (2, _K, 16), flow.bmm, "bmm")
-            _check(test_case, dtype, (1, _K), (2, _K, 16), flow.matmul, "broadcast")
-        problems = [(1, 16, _K), (3, 8, _K)]
-        _check_grouped(test_case, problems, True)
-        _check_grouped(test_case, problems, False)
 
 
 if __name__ == "__main__":

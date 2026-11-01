@@ -1,0 +1,121 @@
+/*
+Copyright 2020 The OneFlow Authors. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+#if defined(WITH_CUDA) && defined(USE_HIP)
+
+#include <cublas_v2.h>
+#include "oneflow/core/common/util.h"
+
+namespace {
+
+__device__ float ToFloat(__half x) { return __half2float(x); }
+__device__ float ToFloat(__hip_bfloat16 x) { return __bfloat162float(x); }
+template<typename T>
+__device__ T FromFloat(float x);
+template<>
+__device__ __half FromFloat<__half>(float x) {
+  return __float2half(x);
+}
+template<>
+__device__ __hip_bfloat16 FromFloat<__hip_bfloat16>(float x) {
+  return __float2bfloat16(x);
+}
+
+// d = tile + beta * d for a rows x cols block of a column-major matrix; d is not read when beta
+// is 0, as in BLAS.
+template<typename T>
+__global__ void StoreTile(int64_t rows, int64_t cols, const float* tile, float beta, T* d,
+                          int64_t ldd) {
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < rows * cols;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    T* p = d + i % rows + i / rows * ldd;
+    float v = tile[i];
+    if (beta != 0.0f) { v += beta * ToFloat(*p); }
+    *p = FromFloat<T>(v);
+  }
+}
+
+// rocBLAS gemm_ex with a float D accumulates the k-chunks in float. D goes through the workspace
+// in tiles, so the workspace bounds the extra memory; rocBLAS does not use that workspace.
+template<typename T>
+hipblasStatus_t RocblasFloatOutputGemm(hipblasHandle_t handle, hipStream_t stream, void* workspace,
+                                       size_t workspace_size, hipblasOperation_t trans_a,
+                                       hipblasOperation_t trans_b, int64_t m, int64_t n, int64_t k,
+                                       float alpha, const T* a, int64_t lda, int64_t stride_a,
+                                       const T* b, int64_t ldb, int64_t stride_b, float beta, T* d,
+                                       hipDataType type, int64_t ldd, int64_t stride_d,
+                                       int64_t batch_count) {
+  const int64_t capacity = workspace_size / sizeof(float);
+  const int64_t tile_m = std::min(m, capacity);
+  const int64_t tile_n = std::min(n, capacity / tile_m);
+  float* tile = static_cast<float*>(workspace);
+  const float zero = 0.0f;
+  for (int64_t batch = 0; batch < batch_count; ++batch) {
+    for (int64_t j = 0; j < n; j += tile_n) {
+      for (int64_t i = 0; i < m; i += tile_m) {
+        const int64_t rows = std::min(tile_m, m - i);
+        const int64_t cols = std::min(tile_n, n - j);
+        const T* tile_a = a + batch * stride_a + (trans_a == HIPBLAS_OP_N ? i : i * lda);
+        const T* tile_b = b + batch * stride_b + (trans_b == HIPBLAS_OP_N ? j * ldb : j);
+        hipblasStatus_t status = hipblasGemmEx(
+            handle, trans_a, trans_b, rows, cols, k, &alpha, tile_a, type, lda, tile_b, type, ldb,
+            &zero, tile, HIP_R_32F, rows, HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
+        if (status != HIPBLAS_STATUS_SUCCESS) { return status; }
+        const int64_t threads = 256;
+        const int64_t blocks = std::min<int64_t>((rows * cols + threads - 1) / threads, 4096);
+        StoreTile<T><<<blocks, threads, 0, stream>>>(rows, cols, tile, beta,
+                                                     d + batch * stride_d + i + j * ldd, ldd);
+        if (hipGetLastError() != hipSuccess) { return HIPBLAS_STATUS_EXECUTION_FAILED; }
+      }
+    }
+  }
+  return HIPBLAS_STATUS_SUCCESS;
+}
+
+}  // namespace
+
+hipblasStatus_t OfLongKGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle, hipStream_t stream,
+                            void* workspace, size_t workspace_size, hipblasOperation_t trans_a,
+                            hipblasOperation_t trans_b, int64_t m, int64_t n, int64_t k,
+                            float alpha, const void* a, int64_t lda, int64_t stride_a,
+                            const void* b, int64_t ldb, int64_t stride_b, float beta, void* d,
+                            hipDataType type, int64_t ldd, int64_t stride_d, int64_t batch_count) {
+  if (oneflow::ParseBooleanFromEnv("ONEFLOW_EP_CUDA_LONG_K_GEMM_USE_HIPBLASLT", true)) {
+    const hipblasStatus_t status = OfHipblasLtGemm(
+        lt_handle, stream, workspace, workspace_size, trans_a, trans_b, m, n, k, alpha, a, lda,
+        stride_a, b, ldb, stride_b, beta, d, type, ldd, stride_d, batch_count);
+    if (status != HIPBLAS_STATUS_NOT_SUPPORTED) { return status; }
+  }
+  if (workspace_size < sizeof(float)) {
+    // No room for a float tile: the plain rocBLAS call, with its per-chunk rounding.
+    return hipblasGemmStridedBatchedEx(
+        handle, trans_a, trans_b, m, n, k, &alpha, a, type, lda, stride_a, b, type, ldb, stride_b,
+        &beta, d, type, ldd, stride_d, batch_count, HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
+  }
+  if (type == HIP_R_16F) {
+    return RocblasFloatOutputGemm(handle, stream, workspace, workspace_size, trans_a, trans_b, m, n,
+                                  k, alpha, static_cast<const __half*>(a), lda, stride_a,
+                                  static_cast<const __half*>(b), ldb, stride_b, beta,
+                                  static_cast<__half*>(d), type, ldd, stride_d, batch_count);
+  } else if (type == HIP_R_16BF) {
+    return RocblasFloatOutputGemm(
+        handle, stream, workspace, workspace_size, trans_a, trans_b, m, n, k, alpha,
+        static_cast<const __hip_bfloat16*>(a), lda, stride_a, static_cast<const __hip_bfloat16*>(b),
+        ldb, stride_b, beta, static_cast<__hip_bfloat16*>(d), type, ldd, stride_d, batch_count);
+  }
+  return HIPBLAS_STATUS_NOT_SUPPORTED;
+}
+
+#endif  // defined(WITH_CUDA) && defined(USE_HIP)

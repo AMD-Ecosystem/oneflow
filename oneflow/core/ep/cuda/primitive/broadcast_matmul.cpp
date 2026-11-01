@@ -207,8 +207,8 @@ void LaunchBroadcastMatmul(Stream* stream, DataType data_type, BlasTransposeType
 #if defined(USE_HIP)
     if (compute_type == CUBLAS_COMPUTE_32F
         && OfRocblasSplitsK(cuda_data_type, cublas_k, cublas_lda, cublas_ldb)) {
-      OF_CUBLAS_CHECK(OfHipblasLtGemm(
-          cuda_stream->cublas_lt_handle(), cuda_stream->cuda_stream(),
+      OF_CUBLAS_CHECK(OfLongKGemm(
+          cuda_stream->cublas_handle(), cuda_stream->cublas_lt_handle(), cuda_stream->cuda_stream(),
           cuda_stream->cublas_workspace(), cuda_stream->cublas_workspace_size(), cublas_trans_a,
           cublas_trans_b, cublas_m, cublas_n, cublas_k, sp_alpha.s, cublas_a, cublas_lda,
           cublas_stride_a, cublas_b, cublas_ldb, cublas_stride_b, sp_beta.s, cublas_c,
@@ -230,11 +230,12 @@ void LaunchBroadcastMatmul(Stream* stream, DataType data_type, BlasTransposeType
 #if defined(USE_HIP)
       if (compute_type == CUBLAS_COMPUTE_32F
           && OfRocblasSplitsK(cuda_data_type, cublas_k, cublas_lda, cublas_ldb)) {
-        OF_CUBLAS_CHECK(OfHipblasLtGemm(
-            cuda_stream->cublas_lt_handle(), cuda_stream->cuda_stream(),
-            cuda_stream->cublas_workspace(), cuda_stream->cublas_workspace_size(), cublas_trans_a,
-            cublas_trans_b, cublas_m, cublas_n, cublas_k, sp_alpha.s, cublas_a, cublas_lda, 0,
-            cublas_b, cublas_ldb, 0, sp_beta.s, cublas_c, cuda_data_type, cublas_ldc, 0, 1));
+        OF_CUBLAS_CHECK(OfLongKGemm(cuda_stream->cublas_handle(), cuda_stream->cublas_lt_handle(),
+                                    cuda_stream->cuda_stream(), cuda_stream->cublas_workspace(),
+                                    cuda_stream->cublas_workspace_size(), cublas_trans_a,
+                                    cublas_trans_b, cublas_m, cublas_n, cublas_k, sp_alpha.s,
+                                    cublas_a, cublas_lda, 0, cublas_b, cublas_ldb, 0, sp_beta.s,
+                                    cublas_c, cuda_data_type, cublas_ldc, 0, 1));
         return;
       }
 #endif  // defined(USE_HIP)

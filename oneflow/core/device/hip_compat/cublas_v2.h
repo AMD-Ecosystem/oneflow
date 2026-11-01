@@ -64,7 +64,7 @@ inline hipblasStatus_t hipblasGemmStridedBatchedEx(
 // rocBLAS gemm_ex splits k into chunks once ld * k of either operand reaches 2^30 and adds each
 // chunk's product into D, so a 16-bit D is rounded once per chunk (about 1025 times for k = 2^20)
 // and the error grows with k. hipBLASLt accumulates the whole product in float and rounds once
-// (it is also much faster on these shapes), so callers send such GEMMs to OfHipblasLtGemm instead.
+// (it is also much faster on these shapes), so callers send such GEMMs to OfLongKGemm instead.
 inline bool OfRocblasSplitsK(hipDataType d_type, int64_t k, int64_t lda, int64_t ldb) {
   return (d_type == HIP_R_16F || d_type == HIP_R_16BF)
          && std::max(lda, ldb) * k >= (int64_t{1} << 30);
@@ -124,10 +124,11 @@ inline hipblasStatus_t OfHipblasLtGemm(hipblasLtHandle_t handle, hipStream_t str
                                                  &max_workspace, sizeof(max_workspace));
   });
   Step([&] {
-    return hipblasLtMatmulAlgoGetHeuristic(handle, desc, layout_a, layout_b, layout_d, layout_d,
-                                           pref, 1, &heuristic, &count);
+    const hipblasStatus_t found = hipblasLtMatmulAlgoGetHeuristic(
+        handle, desc, layout_a, layout_b, layout_d, layout_d, pref, 1, &heuristic, &count);
+    return found != HIPBLAS_STATUS_SUCCESS || count == 0 ? HIPBLAS_STATUS_NOT_SUPPORTED
+                                                         : HIPBLAS_STATUS_SUCCESS;
   });
-  Step([&] { return count == 0 ? HIPBLAS_STATUS_NOT_SUPPORTED : HIPBLAS_STATUS_SUCCESS; });
   Step([&] {
     return hipblasLtMatmul(handle, desc, &alpha, a, layout_a, b, layout_b, &beta, d, layout_d, d,
                            layout_d, &heuristic.algo, workspace, workspace_size, stream);
@@ -139,3 +140,13 @@ inline hipblasStatus_t OfHipblasLtGemm(hipblasLtHandle_t handle, hipStream_t str
   if (desc != nullptr) { hipblasLtMatmulDescDestroy(desc); }
   return status;
 }
+
+// The GEMM OfRocblasSplitsK selects: OfHipblasLtGemm, or, when hipBLASLt has no algorithm for the
+// shape (or ONEFLOW_EP_CUDA_LONG_K_GEMM_USE_HIPBLASLT=0), rocBLAS with a float D in tiles of the
+// workspace, rounded to the 16-bit D once.
+hipblasStatus_t OfLongKGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle, hipStream_t stream,
+                            void* workspace, size_t workspace_size, hipblasOperation_t trans_a,
+                            hipblasOperation_t trans_b, int64_t m, int64_t n, int64_t k,
+                            float alpha, const void* a, int64_t lda, int64_t stride_a,
+                            const void* b, int64_t ldb, int64_t stride_b, float beta, void* d,
+                            hipDataType type, int64_t ldd, int64_t stride_d, int64_t batch_count);
