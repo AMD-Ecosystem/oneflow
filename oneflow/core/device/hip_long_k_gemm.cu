@@ -22,7 +22,7 @@ limitations under the License.
 
 namespace {
 
-int64_t CeilDiv(int64_t a, int64_t b) { return (a + b - 1) / b; }
+__host__ __device__ int64_t CeilDiv(int64_t a, int64_t b) { return (a + b - 1) / b; }
 
 // Splits n items into the fewest pieces of at most `limit`, all of nearly equal size, so that no
 // piece is much narrower than the others.
@@ -42,22 +42,101 @@ __device__ __hip_bfloat16 FromFloat<__hip_bfloat16>(float x) {
   return __float2bfloat16(x);
 }
 
+constexpr int kStoreRows = 32;
+constexpr int kStoreCols = 8;
+constexpr int kStoreSteps = 32;
+
 // d = (the sum of the slices of tile) + beta * d for `count` rows x cols blocks of column-major
 // matrices, block b at d + b * stride_d. tile holds `slices` x count column-major rows x cols
 // matrices back to back, slice s of block b at index s * count + b. The sum is in float and d is
-// rounded once; d is not read when beta is 0, as in BLAS.
+// rounded once; d is not read when beta is 0, as in BLAS. Run with kStoreRows x kStoreCols threads.
+//
+// A 16-bit slice limits each k-chunk's product to the range of the type, and rounds it relative to
+// its own size: a float16 chunk sum above 65504 is inf even when the other chunks cancel it, and
+// chunk sums far larger than the results they cancel to lose those results' precision. So unless a
+// is null, the elements of each kStoreRows x kStoreCols block are computed again from a and b
+// (blocks at stride_a and stride_b) as float dot products over all of k, as a single GEMM
+// accumulating in float gives them, when any element's slices do not sum to a finite value or
+// their root-sum-square exceeds sqrt(3) times the block's largest result, where the slices'
+// expected rounding error would pass that result's own. Inputs that hold inf or NaN give non-finite
+// results either way.
 template<typename T, typename P>
 __global__ void StoreTile(int64_t rows, int64_t cols, int64_t count, int64_t slices, const P* tile,
-                          float beta, T* d, int64_t ldd, int64_t stride_d) {
+                          float beta, T* d, int64_t ldd, int64_t stride_d, bool trans_a,
+                          bool trans_b, int64_t k, float alpha, const T* a, int64_t lda,
+                          int64_t stride_a, const T* b, int64_t ldb, int64_t stride_b) {
+  __shared__ float shared_a[kStoreRows][kStoreSteps + 1];
+  __shared__ float shared_b[kStoreSteps][kStoreCols + 1];
+  __shared__ float wave_max[kStoreRows * kStoreCols];
   const int64_t size = rows * cols;
-  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < size * count;
-       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    const int64_t e = i % size;
-    T* p = d + i / size * stride_d + e % rows + e / rows * ldd;
+  const int64_t blocks_m = CeilDiv(rows, kStoreRows);
+  const int64_t blocks = blocks_m * CeilDiv(cols, kStoreCols);
+  const int tid = threadIdx.y * kStoreRows + threadIdx.x;
+  for (int64_t t = blockIdx.x; t < blocks * count; t += gridDim.x) {
+    const int64_t c = t / blocks;
+    const int64_t i0 = t % blocks % blocks_m * kStoreRows;
+    const int64_t j0 = t % blocks / blocks_m * kStoreCols;
+    const int64_t r = i0 + threadIdx.x;
+    const int64_t col = j0 + threadIdx.y;
+    const bool inside = r < rows && col < cols;
     float v = 0.0f;
-    for (int64_t s = 0; s < slices; ++s) { v += ToFloat(tile[i + s * size * count]); }
-    if (beta != 0.0f) { v += beta * ToFloat(*p); }
-    *p = FromFloat<T>(v);
+    float squares = 0.0f;
+    if (inside) {
+      for (int64_t s = 0; s < slices; ++s) {
+        const float x = ToFloat(tile[c * size + r + col * rows + s * size * count]);
+        v += x;
+        squares += x * x;
+      }
+    }
+    bool again = false;
+    if (a != nullptr) {
+      float largest = inside && isfinite(v) ? fabsf(v) : 0.0f;
+      for (int lane = warpSize / 2; lane > 0; lane /= 2) {
+        largest = fmaxf(largest, __shfl_xor(largest, lane));
+      }
+      if (tid % warpSize == 0) { wave_max[tid / warpSize] = largest; }
+      __syncthreads();
+      for (int w = 0; w < kStoreRows * kStoreCols / warpSize; ++w) {
+        largest = fmaxf(largest, wave_max[w]);
+      }
+      again = __syncthreads_or(inside && !(isfinite(v) && squares <= 3.0f * largest * largest));
+    }
+    if (again) {
+      const T* block_a = a + c * stride_a;
+      const T* block_b = b + c * stride_b;
+      double sum = 0.0;
+      for (int64_t l0 = 0; l0 < k; l0 += kStoreSteps) {
+        // Each step reads op(A)(i0.., l0..) and op(B)(l0.., j0..) along their contiguous index.
+        for (int q = 0; q < kStoreRows * kStoreSteps / (kStoreRows * kStoreCols); ++q) {
+          const int e = q * kStoreRows * kStoreCols + tid;
+          const int ar = trans_a ? e / kStoreSteps : e % kStoreRows;
+          const int al = trans_a ? e % kStoreSteps : e / kStoreRows;
+          const bool ok = i0 + ar < rows && l0 + al < k;
+          shared_a[ar][al] = ok ? ToFloat(trans_a ? block_a[l0 + al + (i0 + ar) * lda]
+                                                  : block_a[i0 + ar + (l0 + al) * lda])
+                                : 0.0f;
+        }
+        const int bl = trans_b ? tid / kStoreCols : tid % kStoreSteps;
+        const int bc = trans_b ? tid % kStoreCols : tid / kStoreSteps;
+        const bool ok = j0 + bc < cols && l0 + bl < k;
+        shared_b[bl][bc] = ok ? ToFloat(trans_b ? block_b[j0 + bc + (l0 + bl) * ldb]
+                                                : block_b[l0 + bl + (j0 + bc) * ldb])
+                              : 0.0f;
+        __syncthreads();
+        float part = 0.0f;
+        for (int q = 0; q < kStoreSteps; ++q) {
+          part = fmaf(shared_a[threadIdx.x][q], shared_b[q][threadIdx.y], part);
+        }
+        sum += part;
+        __syncthreads();
+      }
+      v = alpha * static_cast<float>(sum);
+    }
+    if (inside) {
+      T* p = d + c * stride_d + r + col * ldd;
+      if (beta != 0.0f) { v += beta * ToFloat(*p); }
+      *p = FromFloat<T>(v);
+    }
   }
 }
 
@@ -118,9 +197,10 @@ hipblasStatus_t ChunkProducts(hipblasHandle_t handle, hipblasLtHandle_t lt_handl
 
 // D in tiles of rows x cols x count batches. When chunked, k is cut into chunks of `chunk` (the
 // last may be shorter) whose products are rounded to the type of D in their own slices of the tile,
-// and StoreTile sums the slices in float. Where hipBLASLt has no algorithm for a tile, and
-// throughout when not chunked, rocBLAS gemm_ex writes the tile's whole product with a float D,
-// which it accumulates in float over its own k-chunks; the tile holds either.
+// and StoreTile sums the slices in float (and computes again any element they leave non-finite).
+// Where hipBLASLt has no algorithm for a tile, and throughout when not chunked, rocBLAS gemm_ex
+// writes the tile's whole product with a float D, which it accumulates in float over its own
+// k-chunks; the tile holds either.
 template<typename T>
 hipblasStatus_t TiledGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle, hipStream_t stream,
                           void* workspace, size_t workspace_size, void* tile, int64_t tile_m,
@@ -141,18 +221,21 @@ hipblasStatus_t TiledGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle, h
         const T* tile_a = a + batch * stride_a + (trans_a == HIPBLAS_OP_N ? i : i * lda);
         const T* tile_b = b + batch * stride_b + (trans_b == HIPBLAS_OP_N ? j * ldb : j);
         T* tile_d = d + batch * stride_d + i + j * ldd;
-        const int64_t threads = 256;
-        const int64_t blocks =
-            std::min<int64_t>((rows * cols * count + threads - 1) / threads, 4096);
+        const dim3 threads(kStoreRows, kStoreCols);
+        // One block per output block: StoreTile synchronizes its threads for each.
+        const int64_t blocks = std::min<int64_t>(
+            CeilDiv(rows, kStoreRows) * CeilDiv(cols, kStoreCols) * count, int64_t{1} << 20);
+        const bool ta = trans_a != HIPBLAS_OP_N;
+        const bool tb = trans_b != HIPBLAS_OP_N;
         hipblasStatus_t status = HIPBLAS_STATUS_NOT_SUPPORTED;
         if (chunked) {
           status = ChunkProducts(handle, lt_handle, stream, workspace, workspace_size, trans_a,
                                  trans_b, rows, cols, k, chunk, alpha, tile_a, lda, stride_a,
                                  tile_b, ldb, stride_b, count, static_cast<T*>(tile), type);
           if (status == HIPBLAS_STATUS_SUCCESS) {
-            StoreTile<T, T><<<blocks, threads, 0, stream>>>(rows, cols, count, slices,
-                                                            static_cast<const T*>(tile), beta,
-                                                            tile_d, ldd, stride_d);
+            StoreTile<T, T><<<blocks, threads, 0, stream>>>(
+                rows, cols, count, slices, static_cast<const T*>(tile), beta, tile_d, ldd, stride_d,
+                ta, tb, k, alpha, tile_a, lda, stride_a, tile_b, ldb, stride_b);
           }
         }
         if (status == HIPBLAS_STATUS_NOT_SUPPORTED) {
@@ -165,8 +248,9 @@ hipblasStatus_t TiledGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle, h
                                    HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
           }
           if (status == HIPBLAS_STATUS_SUCCESS) {
-            StoreTile<T, float><<<blocks, threads, 0, stream>>>(rows, cols, count, 1, float_tile,
-                                                                beta, tile_d, ldd, stride_d);
+            StoreTile<T, float><<<blocks, threads, 0, stream>>>(
+                rows, cols, count, 1, float_tile, beta, tile_d, ldd, stride_d, ta, tb, k, alpha,
+                static_cast<const T*>(nullptr), lda, stride_a, tile_b, ldb, stride_b);
           }
         }
         if (status != HIPBLAS_STATUS_SUCCESS) { return status; }

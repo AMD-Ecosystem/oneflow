@@ -32,18 +32,52 @@ _K = 1 << 20
 
 def _check(test_case, dtype, a, b, fn, desc):
     rng = np.random.RandomState(0)
+    _check_values(
+        test_case, dtype, rng.uniform(-1, 1, a), rng.uniform(-1, 1, b), fn, desc
+    )
+
+
+def _check_values(test_case, dtype, a, b, fn, desc):
     # Rounded on the host so that only the 16-bit operands reach the GPU.
-    fa = flow.tensor(rng.uniform(-1, 1, a)).to(dtype)
-    fb = flow.tensor(rng.uniform(-1, 1, b)).to(dtype)
+    fa = flow.tensor(a).to(dtype)
+    fb = flow.tensor(b).to(dtype)
     out = fn(fa.to("cuda"), fb.to("cuda"))
     test_case.assertEqual(out.dtype, dtype)
+    out = out.cpu().to(flow.float64).numpy()
     # The reference multiplies exactly the values the kernel sees.
     ref = fn(fa.to(flow.float64), fb.to(flow.float64)).numpy()
-    err = np.abs(out.cpu().to(flow.float64).numpy() - ref).max() / np.abs(ref).max()
+    # inf and NaN in the inputs give the same non-finite results as in the reference.
+    for where in [np.isnan, np.isposinf, np.isneginf]:
+        test_case.assertTrue(
+            np.array_equal(where(out), where(ref)), "%s %s" % (desc, dtype)
+        )
+    finite = np.isfinite(ref)
+    err = np.abs(out - ref)[finite].max() / np.abs(ref[finite]).max()
     # Accumulated at float precision and rounded to dtype once; rounding the partial sums to
     # dtype along k gives several times this.
     tol = 4 * 2.0 ** -_SIGNIFICAND_BITS[dtype]
     test_case.assertLess(err, tol, "%s %s" % (desc, dtype))
+
+
+def _check_partial_sum_overflow(test_case):
+    # A weight gradient x^T @ dy over 8 blocks of 8192 tokens whose sums (about +-98304) exceed
+    # float16 but cancel to a result inside it (about 32768), as a single GEMM accumulating in
+    # float gives it. Every other input column is small, so its sums stay finite.
+    k, block = 1 << 16, 1 << 13
+    rng = np.random.RandomState(0)
+    x = 4 + rng.uniform(-0.1, 0.1, (k, 64))
+    x[:, 1::2] /= 16
+    sign = np.where(np.arange(k) // block % 2 == 0, 3.0, -2.75)
+    dy = sign[:, None] + rng.uniform(-0.1, 0.1, (k, 32))
+    fn = lambda x, y: flow.matmul(x, y, transpose_a=True)
+    _check_values(test_case, flow.float16, x, dy, fn, "partial sums beyond float16")
+    # Scaled by alpha, the same sums fit in float16 but are several times the result.
+    scaled = lambda x, y: flow.matmul(x, y, transpose_a=True, alpha=-0.5)
+    _check_values(test_case, flow.float16, x, dy, scaled, "large partial sums")
+    x[100, 2] = np.inf
+    x[block + 100, 3] = np.inf
+    x[300, 4] = np.nan
+    _check_values(test_case, flow.float16, x, dy, fn, "inf and NaN inputs")
 
 
 def _check_grouped(test_case, problems, bias):
@@ -110,6 +144,7 @@ def _check_all(test_case):
     # Empty outputs: a weight or an input without rows.
     for problems in [[(2, 0, _K)], [(0, 2, _K)]]:
         _check_grouped(test_case, problems, False)
+    _check_partial_sum_overflow(test_case)
 
 
 def _check_row_tiles(test_case):
