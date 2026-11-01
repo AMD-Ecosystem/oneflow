@@ -90,13 +90,8 @@ hipblasStatus_t OfLongKGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle,
                             float alpha, const void* a, int64_t lda, int64_t stride_a,
                             const void* b, int64_t ldb, int64_t stride_b, float beta, void* d,
                             hipDataType type, int64_t ldd, int64_t stride_d, int64_t batch_count) {
-  // BLAS quick returns: an empty D needs no write, and with k = 0 rocBLAS only scales D by beta.
+  // BLAS quick return: an empty D needs no write.
   if (m == 0 || n == 0 || batch_count == 0) { return HIPBLAS_STATUS_SUCCESS; }
-  if (k == 0) {
-    return hipblasGemmStridedBatchedEx(
-        handle, trans_a, trans_b, m, n, k, &alpha, a, type, lda, stride_a, b, type, ldb, stride_b,
-        &beta, d, type, ldd, stride_d, batch_count, HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
-  }
   if (oneflow::ParseBooleanFromEnv("ONEFLOW_EP_CUDA_LONG_K_GEMM_USE_HIPBLASLT", true)) {
     const hipblasStatus_t status = OfHipblasLtGemm(
         lt_handle, stream, workspace, workspace_size, trans_a, trans_b, m, n, k, alpha, a, lda,
