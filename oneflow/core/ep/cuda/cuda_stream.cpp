@@ -160,7 +160,19 @@ CudaStream::CudaStream(CudaDevice* device)
     const unsigned int stream_flags = ParseIntegerFromEnv(stream_flags_env_name, 0);
     OF_CUDA_CHECK(cudaStreamCreateWithFlags(&cuda_stream_, stream_flags));
   } else {
+#if defined(USE_HIP)
+    // HIP multiplexes ordinary streams onto a small pool of hardware queues, so a kernel can wait
+    // in a queue behind another stream's kernel. The P2P one_embedding kernels spin until the peer
+    // GPUs reach the matching kernel; if the peer's queue holds a collective that waits on this GPU
+    // behind it, both GPUs spin forever. A stream with a CU mask gets a hardware queue of its own,
+    // so streams make progress independently of each other, as on CUDA.
+    const int cu_count = device->properties().multiProcessorCount;
+    std::vector<uint32_t> cu_mask((cu_count + 31) / 32, 0);
+    for (int i = 0; i < cu_count; ++i) { cu_mask.at(i / 32) |= 1U << (i % 32); }
+    OF_CUDA_CHECK(hipExtStreamCreateWithCUMask(&cuda_stream_, cu_mask.size(), cu_mask.data()));
+#else
     OF_CUDA_CHECK(cudaStreamCreate(&cuda_stream_));
+#endif  // defined(USE_HIP)
   }
   // cublas_handle
   OF_CUBLAS_CHECK(cublasCreate(&cublas_handle_));
