@@ -65,30 +65,37 @@ def _apply_op(op_type, inputs, output, attrs, tensors):
     )
 
 
-def _run(fn, x, w, b, dy):
+def _per_axis(value, ndims):
+    return list(value) if isinstance(value, (list, tuple)) else [value] * ndims
+
+
+def _run(fn, x, w, b, dy, weight_grad):
     # x, w, b and dy are channels_first numpy arrays; fn takes and returns channels_first
     # tensors of oneflow on the GPU, or of torch on the CPU, the reference.
     if fn.reference:
-        t = lambda a: torch.tensor(a, requires_grad=True)
+        t = lambda a, grad=True: torch.tensor(a, requires_grad=grad)
     else:
-        t = lambda a: flow.tensor(a, device="cuda", requires_grad=True)
-    x, w = t(x), t(w)
+        t = lambda a, grad=True: flow.tensor(a, device="cuda", requires_grad=grad)
+    x, w = t(x), t(w, weight_grad)
     b = None if b is None else t(b)
     y = fn(x, w, b)
     (
         y * (torch.tensor(dy) if fn.reference else flow.tensor(dy, device="cuda"))
     ).sum().backward()
-    grads = [x.grad, w.grad] + ([] if b is None else [b.grad])
+    grads = (
+        [x.grad] + ([w.grad] if weight_grad else []) + ([] if b is None else [b.grad])
+    )
     return [a.detach().numpy() if fn.reference else a.numpy() for a in [y] + grads]
 
 
-def _compare(test_case, fn, ref_fn, x, w, b, y_shape, desc):
+def _compare(test_case, fn, ref_fn, x, w, b, y_shape, desc, weight_grad=True):
     fn.reference = False
     ref_fn.reference = True
     dy = np.random.RandomState(1).randn(*y_shape)
-    got = _run(fn, x, w, b, dy)
-    ref = _run(ref_fn, x, w, b, dy)
-    for name, g, r in zip(["y", "dx", "dw", "db"], got, ref):
+    got = _run(fn, x, w, b, dy, weight_grad)
+    ref = _run(ref_fn, x, w, b, dy, weight_grad)
+    names = ["y", "dx"] + (["dw"] if weight_grad else []) + ["db"]
+    for name, g, r in zip(names, got, ref):
         test_case.assertEqual(g.shape, r.shape, "%s %s" % (desc, name))
         err = np.abs(g - r).max()
         scale = max(np.abs(r).max(), 1.0)
@@ -97,10 +104,12 @@ def _compare(test_case, fn, ref_fn, x, w, b, y_shape, desc):
         )
 
 
-def _test_conv(test_case, ndims, channels_last, groups, geometry, bias):
-    stride, padding, dilation = geometry
+def _test_conv(
+    test_case, ndims, channels_last, groups, geometry, bias, weight_grad=True
+):
+    stride, padding, dilation = (_per_axis(v, ndims) for v in geometry)
     rng = np.random.RandomState(ndims * 100 + groups)
-    c, f = 4, 6
+    c, f = (6 if groups == 3 else 4), 6
     x = rng.randn(*((2, c) + _SPATIAL[ndims]))
     w = rng.randn(*((f, c // groups) + _KERNEL[ndims]))
     b = rng.randn(f) if bias else None
@@ -119,9 +128,9 @@ def _test_conv(test_case, ndims, channels_last, groups, geometry, bias):
                 x,
                 w,
                 None,
-                stride=[stride] * ndims,
-                padding=[padding] * ndims,
-                dilation=[dilation] * ndims,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
                 groups=groups,
                 channel_pos=data_format,
             )
@@ -130,9 +139,9 @@ def _test_conv(test_case, ndims, channels_last, groups, geometry, bias):
             attrs = {
                 "filters": f,
                 "kernel_size": list(_KERNEL[ndims]),
-                "padding_before": [padding] * ndims,
-                "strides": [stride] * ndims,
-                "dilation_rate": [dilation] * ndims,
+                "padding_before": padding,
+                "strides": stride,
+                "dilation_rate": dilation,
                 "groups": groups,
                 "data_format": data_format,
             }
@@ -149,7 +158,7 @@ def _test_conv(test_case, ndims, channels_last, groups, geometry, bias):
         geometry,
         bias,
     )
-    _compare(test_case, fn, ref_fn, x, w, b, y_shape, desc)
+    _compare(test_case, fn, ref_fn, x, w, b, y_shape, desc, weight_grad)
 
 
 def _test_deconv(test_case, ndims, groups, geometry, bias):
@@ -194,6 +203,34 @@ class TestConvFloat64(flow.unittest.TestCase):
                 # conv_filter_grad supports groups only for channels_first.
                 continue
             _test_conv(test_case, ndims, channels_last, groups, geometry, i % 2 == 0)
+
+    def test_conv_float64_channels_last_groups(test_case):
+        # Forward and data grad only: conv_filter_grad supports groups only for channels_first.
+        for i, (ndims, groups, geometry) in enumerate(
+            itertools.product([1, 2, 3], [2, 3], _GEOMETRY)
+        ):
+            _test_conv(test_case, ndims, True, groups, geometry, i % 2 == 0, False)
+
+    def test_conv_float64_per_axis_geometry(test_case):
+        # Different stride, padding and dilation along each spatial axis.
+        geometries = {
+            2: [((1, 2), (2, 0), (1, 2)), ((3, 1), (0, 1), (2, 1))],
+            3: [((2, 1, 3), (0, 1, 2), (1, 2, 1)), ((1, 3, 2), (2, 0, 1), (2, 1, 1))],
+        }
+        for ndims, cases in geometries.items():
+            for i, (geometry, channels_last, groups) in enumerate(
+                itertools.product(cases, [False, True], [1, 2])
+            ):
+                weight_grad = not (channels_last and groups > 1)
+                _test_conv(
+                    test_case,
+                    ndims,
+                    channels_last,
+                    groups,
+                    geometry,
+                    i % 2 == 0,
+                    weight_grad,
+                )
 
     def test_deconv_float64(test_case):
         for i, (ndims, groups, geometry) in enumerate(
