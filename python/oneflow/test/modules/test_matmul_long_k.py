@@ -42,6 +42,27 @@ def _check(test_case, dtype, a, b, fn, desc):
     test_case.assertLess(err, tol, "%s %s" % (desc, dtype))
 
 
+def _check_grouped(test_case, problems, bias):
+    # grouped_matmul_bias computes x * w^T + b per problem (m, n, k), in float16 only.
+    rng = np.random.RandomState(0)
+    half = lambda a: flow.tensor(a, device="cuda").to(flow.float16)
+    xs = [half(rng.uniform(-1, 1, (m, k))) for m, n, k in problems]
+    ws = [half(rng.uniform(-1, 1, (n, k))) for m, n, k in problems]
+    bs = [half(rng.uniform(-1, 1, n)) for m, n, k in problems] if bias else None
+    if bias:
+        ys = flow._C.grouped_matmul_bias(xs, ws, bs)
+    else:
+        ys = flow._C.grouped_matmul(xs, ws)
+    for i, (x, w, y) in enumerate(zip(xs, ws, ys)):
+        test_case.assertEqual(y.dtype, flow.float16)
+        ref = x.to(flow.float64).numpy() @ w.to(flow.float64).numpy().T
+        if bias:
+            ref += bs[i].to(flow.float64).numpy()
+        err = np.abs(y.to(flow.float64).numpy() - ref).max() / np.abs(ref).max()
+        tol = 4 * 2.0 ** -_SIGNIFICAND_BITS[flow.float16]
+        test_case.assertLess(err, tol, "grouped %s bias=%s" % (problems[i], bias))
+
+
 @flow.unittest.skip_unless_1n1d()
 @unittest.skipIf(os.getenv("ONEFLOW_TEST_CPU_ONLY"), "only test cpu cases")
 class TestMatmulLongK(flow.unittest.TestCase):
@@ -58,6 +79,9 @@ class TestMatmulLongK(flow.unittest.TestCase):
             )
             _check(test_case, dtype, (2, 1, _K), (2, _K, 16), flow.bmm, "bmm")
             _check(test_case, dtype, (1, _K), (2, _K, 16), flow.matmul, "broadcast")
+        problems = [(1, 16, _K), (3, 8, _K)]
+        _check_grouped(test_case, problems, True)
+        _check_grouped(test_case, problems, False)
 
 
 if __name__ == "__main__":
