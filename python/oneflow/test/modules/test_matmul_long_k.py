@@ -113,8 +113,9 @@ def _check_all(test_case):
 
 
 def _check_row_tiles(test_case):
-    # With 256-float tiles, outputs with 300 cuBLAS rows (columns of the oneflow output) take one
-    # full and one partial tile per column. The last two cases run one GEMM per batch.
+    # With tiles of 256 16-bit elements (128 float outputs), outputs with 300 cuBLAS rows (columns
+    # of the oneflow output) take three tiles of 100 rows per column. The last two cases run one
+    # GEMM per batch.
     gen = flow.Generator(device="cuda")
     gen.manual_seed(0)
     rand = lambda *s: flow.rand(*s, device="cuda", generator=gen) * 2 - 1
@@ -143,6 +144,20 @@ def _check_row_tiles(test_case):
             test_case.assertLess(err, tol, "%s, rows in pieces %s" % (desc, dtype))
 
 
+def _check_narrow_last_tile(test_case):
+    # A weight gradient x^T @ dy with an odd number of inputs, cut into output tiles 2 wide, so the
+    # last tile is 1 wide: each tile must be written exactly once, whichever library runs it.
+    with _env("ONEFLOW_EP_CUDA_LONG_K_GEMM_MAX_TILE_SIZE", "100"):
+        _check(
+            test_case,
+            flow.float16,
+            (40000, 1025),
+            (40000, 8),
+            lambda x, y: flow.matmul(x, y, transpose_a=True),
+            "matmul transpose_a, 1-wide last tile",
+        )
+
+
 @contextlib.contextmanager
 def _env(name, value):
     old = os.environ.get(name)
@@ -161,24 +176,26 @@ def _env(name, value):
 class TestMatmulLongK(flow.unittest.TestCase):
     def test_matmul_long_k(test_case):
         _check_all(test_case)
+        _check_narrow_last_tile(test_case)
 
     def test_matmul_long_k_without_hipblaslt(test_case):
         # On ROCm, the path taken when hipBLASLt has no algorithm for a shape. Elsewhere the
         # variable has no effect.
         with _env("ONEFLOW_EP_CUDA_LONG_K_GEMM_USE_HIPBLASLT", "0"):
             _check_all(test_case)
-            # An output larger than the default 4 MiB workspace holds as float, so the
-            # product goes through it in two pieces.
+            # An output larger than the default 4 MiB workspace holds as float, so the float
+            # tile is a separate allocation.
             _check(
                 test_case,
                 flow.float16,
                 (1040, 1 << 15),
                 (1024, 1 << 15),
                 lambda x, y: flow.matmul(x, y, transpose_b=True),
-                "matmul transpose_b, output in pieces",
+                "matmul transpose_b, tile larger than the workspace",
             )
             with _env("ONEFLOW_EP_CUDA_LONG_K_GEMM_MAX_TILE_SIZE", "256"):
                 _check_row_tiles(test_case)
+            _check_narrow_last_tile(test_case)
 
     def test_matmul_long_k_without_workspace(test_case):
         # With no cuBLAS workspace the float tiles of the fallback need their own memory. A stream

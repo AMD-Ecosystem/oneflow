@@ -22,6 +22,13 @@ limitations under the License.
 
 namespace {
 
+int64_t CeilDiv(int64_t a, int64_t b) { return (a + b - 1) / b; }
+
+// Splits n items into the fewest pieces of at most `limit`, all of nearly equal size, so that no
+// piece is much narrower than the others.
+int64_t BalancedPiece(int64_t n, int64_t limit) { return CeilDiv(n, CeilDiv(n, limit)); }
+
+__device__ float ToFloat(float x) { return x; }
 __device__ float ToFloat(__half x) { return __half2float(x); }
 __device__ float ToFloat(__hip_bfloat16 x) { return __bfloat162float(x); }
 template<typename T>
@@ -35,84 +42,135 @@ __device__ __hip_bfloat16 FromFloat<__hip_bfloat16>(float x) {
   return __float2bfloat16(x);
 }
 
-// d = (the sum of the slices of tile) + beta * d for a rows x cols block of a column-major matrix,
-// where tile holds `slices` column-major rows x cols matrices back to back; d is not read when
-// beta is 0, as in BLAS.
-template<typename T>
-__global__ void StoreTile(int64_t rows, int64_t cols, int64_t slices, const float* tile, float beta,
-                          T* d, int64_t ldd) {
-  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < rows * cols;
+// d = (the sum of the slices of tile) + beta * d for `count` rows x cols blocks of column-major
+// matrices, block b at d + b * stride_d. tile holds `slices` x count column-major rows x cols
+// matrices back to back, slice s of block b at index s * count + b. The sum is in float and d is
+// rounded once; d is not read when beta is 0, as in BLAS.
+template<typename T, typename P>
+__global__ void StoreTile(int64_t rows, int64_t cols, int64_t count, int64_t slices, const P* tile,
+                          float beta, T* d, int64_t ldd, int64_t stride_d) {
+  const int64_t size = rows * cols;
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < size * count;
        i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    T* p = d + i % rows + i / rows * ldd;
+    const int64_t e = i % size;
+    T* p = d + i / size * stride_d + e % rows + e / rows * ldd;
     float v = 0.0f;
-    for (int64_t s = 0; s < slices; ++s) { v += tile[i + s * rows * cols]; }
+    for (int64_t s = 0; s < slices; ++s) { v += ToFloat(tile[i + s * size * count]); }
     if (beta != 0.0f) { v += beta * ToFloat(*p); }
     *p = FromFloat<T>(v);
   }
 }
 
-// D in tiles of rows x cols through float. With rocBLAS (chunk = k), gemm_ex with a float D
-// accumulates its own k-chunks in float. With hipBLASLt, k is cut into chunks of `chunk` (the last
-// may be shorter), each chunk's product goes to its own float slice of the tile in one strided
-// batched call (plus one call for a shorter last chunk), and StoreTile sums the slices in float.
-// The tile is tile_size floats in all.
+// The k-chunk products of one tile, each written to its own slice of `tile` in the type of D: one
+// call per chunk with the batch folded in, or one call per batch with the chunks folded in (plus
+// one for a shorter last chunk), whichever needs fewer calls.
 template<typename T>
-hipblasStatus_t FloatOutputGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle,
-                                hipStream_t stream, void* workspace, size_t workspace_size,
-                                float* tile, int64_t tile_size, bool use_hipblaslt, int64_t chunk,
-                                hipblasOperation_t trans_a, hipblasOperation_t trans_b, int64_t m,
-                                int64_t n, int64_t k, float alpha, const T* a, int64_t lda,
-                                int64_t stride_a, const T* b, int64_t ldb, int64_t stride_b,
-                                float beta, T* d, hipDataType type, int64_t ldd, int64_t stride_d,
-                                int64_t batch_count) {
+hipblasStatus_t ChunkProducts(hipblasHandle_t handle, hipblasLtHandle_t lt_handle,
+                              hipStream_t stream, void* workspace, size_t workspace_size,
+                              hipblasOperation_t trans_a, hipblasOperation_t trans_b, int64_t rows,
+                              int64_t cols, int64_t k, int64_t chunk, float alpha, const T* a,
+                              int64_t lda, int64_t stride_a, const T* b, int64_t ldb,
+                              int64_t stride_b, int64_t count, T* tile, hipDataType type) {
+  const int64_t size = rows * cols;
   const int64_t full_chunks = k / chunk;
   const int64_t last_chunk = k % chunk;
   const int64_t slices = full_chunks + (last_chunk > 0 ? 1 : 0);
-  const int64_t tile_m = std::min(m, std::max<int64_t>(1, tile_size / slices));
-  const int64_t tile_n = std::min(n, std::max<int64_t>(1, tile_size / slices / tile_m));
   // Element offsets of k index 1 in A and B.
   const int64_t k_step_a = trans_a == HIPBLAS_OP_N ? lda : 1;
   const int64_t k_step_b = trans_b == HIPBLAS_OP_N ? 1 : ldb;
+  // rocBLAS when it would not split the chunk into shorter k-chunks of its own, which it rounds to
+  // D one by one (see OfUseLongKGemm); it is the library ordinary GEMMs use, and on gfx1100 it is
+  // faster than hipBLASLt for large outputs. hipBLASLt otherwise.
+  const bool rocblas = std::max(lda, ldb) * chunk < (int64_t{1} << 30);
   const float zero = 0.0f;
-  bool written = false;
-  for (int64_t batch = 0; batch < batch_count; ++batch) {
+  const auto Gemm = [&](int64_t kk, const T* ga, int64_t sa, const T* gb, int64_t sb, T* gd,
+                        int64_t sd, int64_t batch) {
+    if (rocblas) {
+      return hipblasGemmStridedBatchedEx(handle, trans_a, trans_b, rows, cols, kk, &alpha, ga, type,
+                                         lda, sa, gb, type, ldb, sb, &zero, gd, type, rows, sd,
+                                         batch, HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
+    }
+    return OfHipblasLtGemm(lt_handle, stream, workspace, workspace_size, trans_a, trans_b, rows,
+                           cols, kk, alpha, ga, lda, sa, gb, ldb, sb, 0.0f, gd, type, type, rows,
+                           sd, batch);
+  };
+  hipblasStatus_t status = HIPBLAS_STATUS_SUCCESS;
+  if (slices <= count * (last_chunk > 0 ? 2 : 1)) {
+    for (int64_t s = 0; s < slices && status == HIPBLAS_STATUS_SUCCESS; ++s) {
+      status = Gemm(std::min(chunk, k - s * chunk), a + s * chunk * k_step_a, stride_a,
+                    b + s * chunk * k_step_b, stride_b, tile + s * count * size, size, count);
+    }
+  } else {
+    for (int64_t i = 0; i < count && status == HIPBLAS_STATUS_SUCCESS; ++i) {
+      if (full_chunks > 0) {
+        status = Gemm(chunk, a + i * stride_a, chunk * k_step_a, b + i * stride_b, chunk * k_step_b,
+                      tile + i * size, count * size, full_chunks);
+      }
+      if (status == HIPBLAS_STATUS_SUCCESS && last_chunk > 0) {
+        status = Gemm(last_chunk, a + i * stride_a + full_chunks * chunk * k_step_a, 0,
+                      b + i * stride_b + full_chunks * chunk * k_step_b, 0,
+                      tile + (full_chunks * count + i) * size, 0, 1);
+      }
+    }
+  }
+  return status;
+}
+
+// D in tiles of rows x cols x count batches. When chunked, k is cut into chunks of `chunk` (the
+// last may be shorter) whose products are rounded to the type of D in their own slices of the tile,
+// and StoreTile sums the slices in float. Where hipBLASLt has no algorithm for a tile, and
+// throughout when not chunked, rocBLAS gemm_ex writes the tile's whole product with a float D,
+// which it accumulates in float over its own k-chunks; the tile holds either.
+template<typename T>
+hipblasStatus_t TiledGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle, hipStream_t stream,
+                          void* workspace, size_t workspace_size, void* tile, int64_t tile_m,
+                          int64_t tile_n, int64_t tile_count, bool chunked, int64_t chunk,
+                          hipblasOperation_t trans_a, hipblasOperation_t trans_b, int64_t m,
+                          int64_t n, int64_t k, float alpha, const T* a, int64_t lda,
+                          int64_t stride_a, const T* b, int64_t ldb, int64_t stride_b, float beta,
+                          T* d, hipDataType type, int64_t ldd, int64_t stride_d,
+                          int64_t batch_count) {
+  const int64_t slices = CeilDiv(k, chunk);
+  const float zero = 0.0f;
+  for (int64_t batch = 0; batch < batch_count; batch += tile_count) {
     for (int64_t j = 0; j < n; j += tile_n) {
       for (int64_t i = 0; i < m; i += tile_m) {
         const int64_t rows = std::min(tile_m, m - i);
         const int64_t cols = std::min(tile_n, n - j);
+        const int64_t count = std::min(tile_count, batch_count - batch);
         const T* tile_a = a + batch * stride_a + (trans_a == HIPBLAS_OP_N ? i : i * lda);
         const T* tile_b = b + batch * stride_b + (trans_b == HIPBLAS_OP_N ? j * ldb : j);
-        hipblasStatus_t status = HIPBLAS_STATUS_SUCCESS;
-        if (!use_hipblaslt) {
-          status = hipblasGemmEx(handle, trans_a, trans_b, rows, cols, k, &alpha, tile_a, type, lda,
-                                 tile_b, type, ldb, &zero, tile, HIP_R_32F, rows,
-                                 HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
-        } else {
-          if (full_chunks > 0) {
-            status = OfHipblasLtGemm(lt_handle, stream, workspace, workspace_size, trans_a, trans_b,
-                                     rows, cols, chunk, alpha, tile_a, lda, chunk * k_step_a,
-                                     tile_b, ldb, chunk * k_step_b, 0.0f, tile, type, HIP_R_32F,
-                                     rows, rows * cols, full_chunks);
-          }
-          if (status == HIPBLAS_STATUS_SUCCESS && last_chunk > 0) {
-            status = OfHipblasLtGemm(lt_handle, stream, workspace, workspace_size, trans_a, trans_b,
-                                     rows, cols, last_chunk, alpha,
-                                     tile_a + full_chunks * chunk * k_step_a, lda, 0,
-                                     tile_b + full_chunks * chunk * k_step_b, ldb, 0, 0.0f,
-                                     tile + full_chunks * rows * cols, type, HIP_R_32F, rows, 0, 1);
+        T* tile_d = d + batch * stride_d + i + j * ldd;
+        const int64_t threads = 256;
+        const int64_t blocks =
+            std::min<int64_t>((rows * cols * count + threads - 1) / threads, 4096);
+        hipblasStatus_t status = HIPBLAS_STATUS_NOT_SUPPORTED;
+        if (chunked) {
+          status = ChunkProducts(handle, lt_handle, stream, workspace, workspace_size, trans_a,
+                                 trans_b, rows, cols, k, chunk, alpha, tile_a, lda, stride_a,
+                                 tile_b, ldb, stride_b, count, static_cast<T*>(tile), type);
+          if (status == HIPBLAS_STATUS_SUCCESS) {
+            StoreTile<T, T><<<blocks, threads, 0, stream>>>(rows, cols, count, slices,
+                                                            static_cast<const T*>(tile), beta,
+                                                            tile_d, ldd, stride_d);
           }
         }
-        // Once part of D is written, the caller cannot fall back to another library.
-        if (status == HIPBLAS_STATUS_NOT_SUPPORTED && written) {
-          status = HIPBLAS_STATUS_INTERNAL_ERROR;
+        if (status == HIPBLAS_STATUS_NOT_SUPPORTED) {
+          float* float_tile = static_cast<float*>(tile);
+          status = HIPBLAS_STATUS_SUCCESS;
+          for (int64_t c = 0; c < count && status == HIPBLAS_STATUS_SUCCESS; ++c) {
+            status = hipblasGemmEx(handle, trans_a, trans_b, rows, cols, k, &alpha,
+                                   tile_a + c * stride_a, type, lda, tile_b + c * stride_b, type,
+                                   ldb, &zero, float_tile + c * rows * cols, HIP_R_32F, rows,
+                                   HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
+          }
+          if (status == HIPBLAS_STATUS_SUCCESS) {
+            StoreTile<T, float><<<blocks, threads, 0, stream>>>(rows, cols, count, 1, float_tile,
+                                                                beta, tile_d, ldd, stride_d);
+          }
         }
         if (status != HIPBLAS_STATUS_SUCCESS) { return status; }
-        const int64_t threads = 256;
-        const int64_t blocks = std::min<int64_t>((rows * cols + threads - 1) / threads, 4096);
-        StoreTile<T><<<blocks, threads, 0, stream>>>(rows, cols, use_hipblaslt ? slices : 1, tile,
-                                                     beta, d + batch * stride_d + i + j * ldd, ldd);
         if (hipGetLastError() != hipSuccess) { return HIPBLAS_STATUS_EXECUTION_FAILED; }
-        written = true;
       }
     }
   }
@@ -154,7 +212,7 @@ hipblasStatus_t OfLongKGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle,
   if (m == 0 || n == 0 || batch_count == 0) { return HIPBLAS_STATUS_SUCCESS; }
   const bool use_hipblaslt =
       oneflow::ParseBooleanFromEnv("ONEFLOW_EP_CUDA_LONG_K_GEMM_USE_HIPBLASLT", true);
-  // Where the accumulator drifts, hipBLASLt gets no GEMM with k above kOfLongKGemmChain. That also
+  // Where the accumulator drifts, no library gets a GEMM with k above kOfLongKGemmChain. That also
   // keeps clear of kernels that are wrong only at large k: on gfx1201 the heuristic's first choice
   // for k-major A and small outputs is off by tens of float16 ulp for some k above 2^17, and a
   // hipBLASLt split-k does not change that.
@@ -166,51 +224,58 @@ hipblasStatus_t OfLongKGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle,
     if (status != HIPBLAS_STATUS_NOT_SUPPORTED) { return status; }
   }
   if (type != HIP_R_16F && type != HIP_R_16BF) { return HIPBLAS_STATUS_NOT_SUPPORTED; }
-  // A float tile of at most ONEFLOW_EP_CUDA_LONG_K_GEMM_MAX_TILE_SIZE output elements (4 MiB by
-  // default) per k-chunk, in the workspace when that is large enough and a temporary allocation
-  // otherwise; never a library call with the 16-bit D. hipBLASLt gets the rest of the workspace.
+  // Equal chunks of about 2^13, which measured more accurate than longer ones and no slower; but
+  // at most 16 of them unless that would make a chunk longer than kOfLongKGemmChain, so that the
+  // slices need little memory.
+  const int64_t slices =
+      chunked ? std::max(CeilDiv(k, kOfLongKGemmChain), std::min<int64_t>(CeilDiv(k, 1 << 13), 16))
+              : 1;
+  const int64_t chunk = CeilDiv(k, slices);
+  // Tiles of at most ONEFLOW_EP_CUDA_LONG_K_GEMM_MAX_TILE_SIZE elements of the type of D in all,
+  // which hold each output element once per k-chunk (or once in float for the rocBLAS path); in
+  // the workspace when that is large enough and a temporary allocation otherwise. hipBLASLt gets
+  // the rest of the workspace.
   const int64_t max_tile_size = std::max<int64_t>(
       1,
-      oneflow::ParseIntegerFromEnv("ONEFLOW_EP_CUDA_LONG_K_GEMM_MAX_TILE_SIZE", int64_t{1} << 20));
-  const auto Run = [&](bool hipblaslt) {
-    // Equal chunks of at most kOfLongKGemmChain, so that one call does nearly all the work.
-    const int64_t slices = hipblaslt ? (k + kOfLongKGemmChain - 1) / kOfLongKGemmChain : 1;
-    const int64_t chunk = (k + slices - 1) / slices;
-    // Up to max_tile_size output elements in each slice.
-    const int64_t tile_size = std::min(m * n, max_tile_size) * slices;
-    // 256-byte aligned, as hipBLASLt expects of its workspace.
-    const size_t tile_bytes = (tile_size * sizeof(float) + 255) / 256 * 256;
-    void* tile = workspace;
-    void* lt_workspace = workspace;
-    size_t lt_workspace_size = workspace_size;
-    if (workspace_size >= tile_bytes) {
-      lt_workspace = static_cast<char*>(workspace) + tile_bytes;
-      lt_workspace_size = workspace_size - tile_bytes;
-    } else if (hipMallocAsync(&tile, tile_bytes, stream) != hipSuccess) {
-      return HIPBLAS_STATUS_ALLOC_FAILED;
-    }
-    hipblasStatus_t status;
-    if (type == HIP_R_16F) {
-      status = FloatOutputGemm(handle, lt_handle, stream, lt_workspace, lt_workspace_size,
-                               static_cast<float*>(tile), tile_size, hipblaslt, chunk, trans_a,
-                               trans_b, m, n, k, alpha, static_cast<const __half*>(a), lda,
-                               stride_a, static_cast<const __half*>(b), ldb, stride_b, beta,
-                               static_cast<__half*>(d), type, ldd, stride_d, batch_count);
-    } else {
-      status = FloatOutputGemm(handle, lt_handle, stream, lt_workspace, lt_workspace_size,
-                               static_cast<float*>(tile), tile_size, hipblaslt, chunk, trans_a,
-                               trans_b, m, n, k, alpha, static_cast<const __hip_bfloat16*>(a), lda,
-                               stride_a, static_cast<const __hip_bfloat16*>(b), ldb, stride_b, beta,
-                               static_cast<__hip_bfloat16*>(d), type, ldd, stride_d, batch_count);
-    }
-    if (tile != workspace) { (void)hipFreeAsync(tile, stream); }
-    return status;
-  };
-  if (chunked) {
-    const hipblasStatus_t status = Run(true);
-    if (status != HIPBLAS_STATUS_NOT_SUPPORTED) { return status; }
+      oneflow::ParseIntegerFromEnv("ONEFLOW_EP_CUDA_LONG_K_GEMM_MAX_TILE_SIZE", int64_t{1} << 25));
+  const int64_t units = std::max<int64_t>(slices, sizeof(float) / 2);
+  const int64_t max_outputs = std::max<int64_t>(1, max_tile_size / units);
+  int64_t tile_m = m;
+  int64_t tile_n = n;
+  int64_t tile_count = 1;
+  if (m * n <= max_outputs) {
+    tile_count = BalancedPiece(batch_count, max_outputs / (m * n));
+  } else {
+    tile_m = BalancedPiece(m, max_outputs);
+    tile_n = BalancedPiece(n, std::max<int64_t>(1, max_outputs / tile_m));
   }
-  return Run(false);
+  // 256-byte aligned, as hipBLASLt expects of its workspace.
+  const size_t tile_bytes = (tile_m * tile_n * tile_count * units * 2 + 255) / 256 * 256;
+  void* tile = workspace;
+  void* lt_workspace = workspace;
+  size_t lt_workspace_size = workspace_size;
+  if (workspace_size >= tile_bytes) {
+    lt_workspace = static_cast<char*>(workspace) + tile_bytes;
+    lt_workspace_size = workspace_size - tile_bytes;
+  } else if (hipMallocAsync(&tile, tile_bytes, stream) != hipSuccess) {
+    return HIPBLAS_STATUS_ALLOC_FAILED;
+  }
+  hipblasStatus_t status;
+  if (type == HIP_R_16F) {
+    status =
+        TiledGemm(handle, lt_handle, stream, lt_workspace, lt_workspace_size, tile, tile_m, tile_n,
+                  tile_count, chunked, chunk, trans_a, trans_b, m, n, k, alpha,
+                  static_cast<const __half*>(a), lda, stride_a, static_cast<const __half*>(b), ldb,
+                  stride_b, beta, static_cast<__half*>(d), type, ldd, stride_d, batch_count);
+  } else {
+    status = TiledGemm(handle, lt_handle, stream, lt_workspace, lt_workspace_size, tile, tile_m,
+                       tile_n, tile_count, chunked, chunk, trans_a, trans_b, m, n, k, alpha,
+                       static_cast<const __hip_bfloat16*>(a), lda, stride_a,
+                       static_cast<const __hip_bfloat16*>(b), ldb, stride_b, beta,
+                       static_cast<__hip_bfloat16*>(d), type, ldd, stride_d, batch_count);
+  }
+  if (tile != workspace) { (void)hipFreeAsync(tile, stream); }
+  return status;
 }
 
 #endif  // defined(WITH_CUDA) && defined(USE_HIP)

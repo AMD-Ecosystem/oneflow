@@ -148,10 +148,10 @@ inline hipblasStatus_t OfHipblasLtGemm(hipblasLtHandle_t handle, hipStream_t str
   return status;
 }
 
-// The GEMM OfUseLongKGemm selects: OfHipblasLtGemm (where the accumulator drifts, on k-chunks of
-// at most kOfLongKGemmChain with float partial products), or, when hipBLASLt has no algorithm for
-// the shape (or ONEFLOW_EP_CUDA_LONG_K_GEMM_USE_HIPBLASLT=0), rocBLAS with a float D in tiles,
-// rounded to the 16-bit D once.
+// The GEMM OfUseLongKGemm selects: OfHipblasLtGemm, or where the accumulator drifts, k-chunks of
+// at most kOfLongKGemmChain whose 16-bit partial products are summed in float; or, when hipBLASLt
+// has no algorithm for a shape or tile (or ONEFLOW_EP_CUDA_LONG_K_GEMM_USE_HIPBLASLT=0), rocBLAS
+// with a float D in tiles. Either way the 16-bit D is rounded from float once.
 hipblasStatus_t OfLongKGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle, hipStream_t stream,
                             void* workspace, size_t workspace_size, hipblasOperation_t trans_a,
                             hipblasOperation_t trans_b, int64_t m, int64_t n, int64_t k,
