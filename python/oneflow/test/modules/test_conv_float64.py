@@ -13,12 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
-import os
-
-# Pass the bias to the convolution kernel itself instead of adding it afterwards.
-os.environ.setdefault("ONEFLOW_KERNEL_ENABLE_FUSED_CONV_BIAS", "1")
-
 import itertools
+import os
 import unittest
 
 import numpy as np
@@ -118,16 +114,31 @@ def _test_conv(test_case, ndims, channels_last, groups, geometry, bias):
             # Run on the channels_last layouts, compare in channels_first.
             perm = [0] + list(range(2, ndims + 2)) + [1]
             x, w = x.permute(*perm), w.permute(*perm)
-        y = _CONV[ndims](
-            x,
-            w,
-            b,
-            stride=[stride] * ndims,
-            padding=[padding] * ndims,
-            dilation=[dilation] * ndims,
-            groups=groups,
-            channel_pos=data_format,
-        )
+        if b is None:
+            y = _CONV[ndims](
+                x,
+                w,
+                None,
+                stride=[stride] * ndims,
+                padding=[padding] * ndims,
+                dilation=[dilation] * ndims,
+                groups=groups,
+                channel_pos=data_format,
+            )
+        else:
+            # Give the bias to the convolution op itself, as the fused conv bias path does.
+            attrs = {
+                "filters": f,
+                "kernel_size": list(_KERNEL[ndims]),
+                "padding_before": [padding] * ndims,
+                "strides": [stride] * ndims,
+                "dilation_rate": [dilation] * ndims,
+                "groups": groups,
+                "data_format": data_format,
+            }
+            y = _apply_op(
+                "conv%dd" % ndims, ["in", "weight", "bias"], "out", attrs, [x, w, b]
+            )
         return y.permute(0, ndims + 1, *range(1, ndims + 1)) if channels_last else y
 
     y_shape = tuple(ref_fn(torch.tensor(x), torch.tensor(w), None).shape)
