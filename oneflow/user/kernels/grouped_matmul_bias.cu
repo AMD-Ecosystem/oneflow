@@ -143,7 +143,7 @@ void ApplyGroup(const Problem& problem, std::vector<Buffer<T>> ptrs, bool has_bi
   auto sp_alpha = GetCublasScalarParameter(alpha, compute_type);
   auto sp_beta = GetCublasScalarParameter(beta, compute_type);
 #if defined(USE_HIP)
-  if (compute_type == CUDA_R_32F && OfRocblasSplitsK(data_type, problem.k, problem.k, problem.k)) {
+  if (compute_type == CUDA_R_32F && OfUseLongKGemm(data_type, problem.k, problem.k, problem.k)) {
     auto* cuda_stream = stream->As<ep::CudaStream>();
     for (int i = 0; i < params.n; ++i) {
       OF_CUBLAS_CHECK(OfLongKGemm(

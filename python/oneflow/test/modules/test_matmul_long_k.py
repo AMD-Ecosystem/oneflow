@@ -81,6 +81,15 @@ def _check_all(test_case):
             lambda x, y: flow.matmul(x, y, transpose_b=True),
             "matmul transpose_b",
         )
+        # Neither operand has k as its leading dimension.
+        _check(
+            test_case,
+            dtype,
+            (_K, 2),
+            (_K, 16),
+            lambda x, y: flow.matmul(x, y, transpose_a=True),
+            "matmul transpose_a",
+        )
         _check(test_case, dtype, (2, 1, _K), (2, _K, 16), flow.bmm, "bmm")
         _check(test_case, dtype, (1, _K), (2, _K, 16), flow.matmul, "broadcast")
     problems = [(1, 16, _K), (3, 8, _K)]

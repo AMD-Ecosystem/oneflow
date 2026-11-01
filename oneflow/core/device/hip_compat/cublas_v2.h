@@ -65,19 +65,33 @@ inline hipblasStatus_t hipblasGemmStridedBatchedEx(
 // chunk's product into D, so a 16-bit D is rounded once per chunk (about 1025 times for k = 2^20)
 // and the error grows with k. hipBLASLt accumulates the whole product in float and rounds once
 // (it is also much faster on these shapes), so callers send such GEMMs to OfLongKGemm instead.
-inline bool OfRocblasSplitsK(hipDataType d_type, int64_t k, int64_t lda, int64_t ldb) {
+// On GPUs where OfMatrixCoreAccumulationDrifts holds, a float accumulator chain longer than
+// kOfLongKGemmChain also loses precision in either library, so any longer k goes there too.
+constexpr int64_t kOfLongKGemmChain = int64_t{1} << 15;
+bool OfMatrixCoreAccumulationDrifts();
+inline bool OfUseLongKGemm(hipDataType d_type, int64_t k, int64_t lda, int64_t ldb) {
   return (d_type == HIP_R_16F || d_type == HIP_R_16BF)
-         && std::max(lda, ldb) * k >= (int64_t{1} << 30);
+         && (std::max(lda, ldb) * k >= (int64_t{1} << 30)
+             || (k > kOfLongKGemmChain && OfMatrixCoreAccumulationDrifts()));
 }
 
-// Column-major strided batched D = alpha * op(A) * op(B) + beta * D with float compute.
+// Column-major strided batched D = alpha * op(A) * op(B) + beta * D with float compute. With
+// split_k > 1, k is split into that many partial products, summed in float.
+hipblasStatus_t OfHipblasLtSplitKGemm(hipblasLtHandle_t handle, hipStream_t stream, void* workspace,
+                                      size_t workspace_size, hipblasLtMatmulDesc_t desc,
+                                      hipblasLtMatrixLayout_t layout_a,
+                                      hipblasLtMatrixLayout_t layout_b,
+                                      hipblasLtMatrixLayout_t layout_d,
+                                      hipblasLtMatmulPreference_t pref, float alpha, const void* a,
+                                      const void* b, float beta, void* d, int64_t split_k);
 inline hipblasStatus_t OfHipblasLtGemm(hipblasLtHandle_t handle, hipStream_t stream,
                                        void* workspace, size_t workspace_size,
                                        hipblasOperation_t trans_a, hipblasOperation_t trans_b,
                                        int64_t m, int64_t n, int64_t k, float alpha, const void* a,
                                        int64_t lda, int64_t stride_a, const void* b, int64_t ldb,
                                        int64_t stride_b, float beta, void* d, hipDataType type,
-                                       int64_t ldd, int64_t stride_d, int64_t batch_count) {
+                                       int64_t ldd, int64_t stride_d, int64_t batch_count,
+                                       int64_t split_k) {
   hipblasLtMatmulDesc_t desc = nullptr;
   hipblasLtMatrixLayout_t layout_a = nullptr;
   hipblasLtMatrixLayout_t layout_b = nullptr;
@@ -123,16 +137,23 @@ inline hipblasStatus_t OfHipblasLtGemm(hipblasLtHandle_t handle, hipStream_t str
     return hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                                  &max_workspace, sizeof(max_workspace));
   });
-  Step([&] {
-    const hipblasStatus_t found = hipblasLtMatmulAlgoGetHeuristic(
-        handle, desc, layout_a, layout_b, layout_d, layout_d, pref, 1, &heuristic, &count);
-    return found != HIPBLAS_STATUS_SUCCESS || count == 0 ? HIPBLAS_STATUS_NOT_SUPPORTED
-                                                         : HIPBLAS_STATUS_SUCCESS;
-  });
-  Step([&] {
-    return hipblasLtMatmul(handle, desc, &alpha, a, layout_a, b, layout_b, &beta, d, layout_d, d,
-                           layout_d, &heuristic.algo, workspace, workspace_size, stream);
-  });
+  if (split_k > 1) {
+    Step([&] {
+      return OfHipblasLtSplitKGemm(handle, stream, workspace, workspace_size, desc, layout_a,
+                                   layout_b, layout_d, pref, alpha, a, b, beta, d, split_k);
+    });
+  } else {
+    Step([&] {
+      const hipblasStatus_t found = hipblasLtMatmulAlgoGetHeuristic(
+          handle, desc, layout_a, layout_b, layout_d, layout_d, pref, 1, &heuristic, &count);
+      return found != HIPBLAS_STATUS_SUCCESS || count == 0 ? HIPBLAS_STATUS_NOT_SUPPORTED
+                                                           : HIPBLAS_STATUS_SUCCESS;
+    });
+    Step([&] {
+      return hipblasLtMatmul(handle, desc, &alpha, a, layout_a, b, layout_b, &beta, d, layout_d, d,
+                             layout_d, &heuristic.algo, workspace, workspace_size, stream);
+    });
+  }
   if (pref != nullptr) { hipblasLtMatmulPreferenceDestroy(pref); }
   if (layout_d != nullptr) { hipblasLtMatrixLayoutDestroy(layout_d); }
   if (layout_b != nullptr) { hipblasLtMatrixLayoutDestroy(layout_b); }
@@ -141,7 +162,7 @@ inline hipblasStatus_t OfHipblasLtGemm(hipblasLtHandle_t handle, hipStream_t str
   return status;
 }
 
-// The GEMM OfRocblasSplitsK selects: OfHipblasLtGemm, or, when hipBLASLt has no algorithm for the
+// The GEMM OfUseLongKGemm selects: OfHipblasLtGemm, or, when hipBLASLt has no algorithm for the
 // shape (or ONEFLOW_EP_CUDA_LONG_K_GEMM_USE_HIPBLASLT=0), rocBLAS with a float D in tiles,
 // rounded to the 16-bit D once.
 hipblasStatus_t OfLongKGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle, hipStream_t stream,

@@ -16,6 +16,10 @@ limitations under the License.
 #if defined(WITH_CUDA) && defined(USE_HIP)
 
 #include <cublas_v2.h>
+#include <hipblaslt/hipblaslt-ext.hpp>
+#include <limits>
+#include <string>
+#include <vector>
 #include "oneflow/core/common/util.h"
 
 namespace {
@@ -84,6 +88,64 @@ hipblasStatus_t RocblasFloatOutputGemm(hipblasHandle_t handle, hipStream_t strea
 
 }  // namespace
 
+// The gfx11 and gfx12 matrix instructions (WMMA) do not round the float accumulator to nearest: a
+// chain of 2^20 products drifts about 100 times further than a chain of fp32 FMAs, while gfx9
+// (MFMA) keeps fp32 accuracy.
+bool OfMatrixCoreAccumulationDrifts() {
+  static const std::vector<bool> drifts = [] {
+    int count = 0;
+    if (hipGetDeviceCount(&count) != hipSuccess) { count = 0; }
+    std::vector<bool> result(count);
+    for (int i = 0; i < count; ++i) {
+      hipDeviceProp_t prop;
+      if (hipGetDeviceProperties(&prop, i) != hipSuccess) { continue; }
+      const std::string arch = prop.gcnArchName;
+      result[i] = arch.rfind("gfx11", 0) == 0 || arch.rfind("gfx12", 0) == 0;
+    }
+    return result;
+  }();
+  int device = 0;
+  if (hipGetDevice(&device) != hipSuccess || device >= static_cast<int>(drifts.size())) {
+    return false;
+  }
+  return drifts[device];
+}
+
+hipblasStatus_t OfHipblasLtSplitKGemm(hipblasLtHandle_t handle, hipStream_t stream, void* workspace,
+                                      size_t workspace_size, hipblasLtMatmulDesc_t desc,
+                                      hipblasLtMatrixLayout_t layout_a,
+                                      hipblasLtMatrixLayout_t layout_b,
+                                      hipblasLtMatrixLayout_t layout_d,
+                                      hipblasLtMatmulPreference_t pref, float alpha, const void* a,
+                                      const void* b, float beta, void* d, int64_t split_k) {
+  if (split_k > std::numeric_limits<uint16_t>::max()) { return HIPBLAS_STATUS_NOT_SUPPORTED; }
+  constexpr int kRequested = 8;
+  hipblasLtMatmulHeuristicResult_t heuristic[kRequested];
+  int count = 0;
+  if (hipblasLtMatmulAlgoGetHeuristic(handle, desc, layout_a, layout_b, layout_d, layout_d, pref,
+                                      kRequested, heuristic, &count)
+      != HIPBLAS_STATUS_SUCCESS) {
+    return HIPBLAS_STATUS_NOT_SUPPORTED;
+  }
+  hipblaslt_ext::Gemm gemm(handle, desc, &alpha, a, layout_a, b, layout_b, &beta, d, layout_d, d,
+                           layout_d);
+  hipblaslt_ext::GemmTuning tuning;
+  tuning.setSplitK(static_cast<uint16_t>(split_k));
+  // The first algorithm, in heuristic order, that takes this split within the workspace.
+  for (int i = 0; i < count; ++i) {
+    size_t needed = 0;
+    if (gemm.isAlgoSupported(heuristic[i].algo, tuning, needed) != HIPBLAS_STATUS_SUCCESS
+        || needed > workspace_size) {
+      continue;
+    }
+    const hipblasStatus_t status =
+        gemm.initialize(heuristic[i].algo, tuning, workspace, false, stream);
+    if (status != HIPBLAS_STATUS_SUCCESS) { return status; }
+    return gemm.run(stream);
+  }
+  return HIPBLAS_STATUS_NOT_SUPPORTED;
+}
+
 hipblasStatus_t OfLongKGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle, hipStream_t stream,
                             void* workspace, size_t workspace_size, hipblasOperation_t trans_a,
                             hipblasOperation_t trans_b, int64_t m, int64_t n, int64_t k,
@@ -93,9 +155,12 @@ hipblasStatus_t OfLongKGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle,
   // BLAS quick return: an empty D needs no write.
   if (m == 0 || n == 0 || batch_count == 0) { return HIPBLAS_STATUS_SUCCESS; }
   if (oneflow::ParseBooleanFromEnv("ONEFLOW_EP_CUDA_LONG_K_GEMM_USE_HIPBLASLT", true)) {
+    // Where the accumulator drifts, keep each partial product within kOfLongKGemmChain.
+    const int64_t split_k =
+        OfMatrixCoreAccumulationDrifts() ? (k + kOfLongKGemmChain - 1) / kOfLongKGemmChain : 1;
     const hipblasStatus_t status = OfHipblasLtGemm(
         lt_handle, stream, workspace, workspace_size, trans_a, trans_b, m, n, k, alpha, a, lda,
-        stride_a, b, ldb, stride_b, beta, d, type, ldd, stride_d, batch_count);
+        stride_a, b, ldb, stride_b, beta, d, type, ldd, stride_d, batch_count, split_k);
     if (status != HIPBLAS_STATUS_NOT_SUPPORTED) { return status; }
   }
   if (type != HIP_R_16F && type != HIP_R_16BF) { return HIPBLAS_STATUS_NOT_SUPPORTED; }

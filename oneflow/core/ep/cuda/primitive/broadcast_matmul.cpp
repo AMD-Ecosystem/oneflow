@@ -206,7 +206,7 @@ void LaunchBroadcastMatmul(Stream* stream, DataType data_type, BlasTransposeType
     const auto sp_beta = GetCublasScalarParameter(beta, compute_type);
 #if defined(USE_HIP)
     if (compute_type == CUBLAS_COMPUTE_32F
-        && OfRocblasSplitsK(cuda_data_type, cublas_k, cublas_lda, cublas_ldb)) {
+        && OfUseLongKGemm(cuda_data_type, cublas_k, cublas_lda, cublas_ldb)) {
       OF_CUBLAS_CHECK(OfLongKGemm(
           cuda_stream->cublas_handle(), cuda_stream->cublas_lt_handle(), cuda_stream->cuda_stream(),
           cuda_stream->cublas_workspace(), cuda_stream->cublas_workspace_size(), cublas_trans_a,
@@ -229,7 +229,7 @@ void LaunchBroadcastMatmul(Stream* stream, DataType data_type, BlasTransposeType
       void* cublas_c = batch_c;
 #if defined(USE_HIP)
       if (compute_type == CUBLAS_COMPUTE_32F
-          && OfRocblasSplitsK(cuda_data_type, cublas_k, cublas_lda, cublas_ldb)) {
+          && OfUseLongKGemm(cuda_data_type, cublas_k, cublas_lda, cublas_ldb)) {
         OF_CUBLAS_CHECK(OfLongKGemm(cuda_stream->cublas_handle(), cuda_stream->cublas_lt_handle(),
                                     cuda_stream->cuda_stream(), cuda_stream->cublas_workspace(),
                                     cuda_stream->cublas_workspace_size(), cublas_trans_a,
