@@ -32,13 +32,14 @@ _K = 1 << 20
 
 def _check(test_case, dtype, a, b, fn, desc):
     rng = np.random.RandomState(0)
-    fa = flow.tensor(rng.uniform(-1, 1, a), device="cuda").to(dtype)
-    fb = flow.tensor(rng.uniform(-1, 1, b), device="cuda").to(dtype)
-    out = fn(fa, fb)
+    # Rounded on the host so that only the 16-bit operands reach the GPU.
+    fa = flow.tensor(rng.uniform(-1, 1, a)).to(dtype)
+    fb = flow.tensor(rng.uniform(-1, 1, b)).to(dtype)
+    out = fn(fa.to("cuda"), fb.to("cuda"))
     test_case.assertEqual(out.dtype, dtype)
     # The reference multiplies exactly the values the kernel sees.
-    ref = fn(fa.to(flow.float64).cpu(), fb.to(flow.float64).cpu()).numpy()
-    err = np.abs(out.to(flow.float64).numpy() - ref).max() / np.abs(ref).max()
+    ref = fn(fa.to(flow.float64), fb.to(flow.float64)).numpy()
+    err = np.abs(out.cpu().to(flow.float64).numpy() - ref).max() / np.abs(ref).max()
     # Accumulated at float precision and rounded to dtype once; rounding the partial sums to
     # dtype along k gives several times this.
     tol = 4 * 2.0 ** -_SIGNIFICAND_BITS[dtype]
@@ -48,7 +49,7 @@ def _check(test_case, dtype, a, b, fn, desc):
 def _check_grouped(test_case, problems, bias):
     # grouped_matmul_bias computes x * w^T + b per problem (m, n, k), in float16 only.
     rng = np.random.RandomState(0)
-    half = lambda a: flow.tensor(a, device="cuda").to(flow.float16)
+    half = lambda a: flow.tensor(a).to(flow.float16).to("cuda")
     xs = [half(rng.uniform(-1, 1, (m, k))) for m, n, k in problems]
     ws = [half(rng.uniform(-1, 1, (n, k))) for m, n, k in problems]
     bs = [half(rng.uniform(-1, 1, n)) for m, n, k in problems] if bias else None
@@ -61,10 +62,10 @@ def _check_grouped(test_case, problems, bias):
         test_case.assertEqual(tuple(y.shape), problems[i][:2])
         if y.numel() == 0:
             continue
-        ref = x.to(flow.float64).numpy() @ w.to(flow.float64).numpy().T
+        ref = x.cpu().to(flow.float64).numpy() @ w.cpu().to(flow.float64).numpy().T
         if bias:
-            ref += bs[i].to(flow.float64).numpy()
-        err = np.abs(y.to(flow.float64).numpy() - ref).max() / np.abs(ref).max()
+            ref += bs[i].cpu().to(flow.float64).numpy()
+        err = np.abs(y.cpu().to(flow.float64).numpy() - ref).max() / np.abs(ref).max()
         tol = 4 * 2.0 ** -_SIGNIFICAND_BITS[flow.float16]
         test_case.assertLess(err, tol, "grouped %s bias=%s" % (problems[i], bias))
 
@@ -91,17 +92,23 @@ def _check_all(test_case):
 
 
 def _check_row_tiles(test_case):
-    # With 2^15-float tiles, outputs with 40000 cuBLAS rows (columns of the oneflow output) take
-    # one full and one partial tile per column. Every input stays below 2^31 elements.
+    # With 256-float tiles, outputs with 300 cuBLAS rows (columns of the oneflow output) take one
+    # full and one partial tile per column. The last two cases run one GEMM per batch.
     gen = flow.Generator(device="cuda")
     gen.manual_seed(0)
     rand = lambda *s: flow.rand(*s, device="cuda", generator=gen) * 2 - 1
-    k, n = 1 << 15, 40000
+    k, n = 1 << 15, 300
     cases = [
         ((3, k), (k, n), {}, "matmul"),
         ((3, k), (n, k), {"transpose_b": True}, "matmul transpose_b"),
-        ((k, 3), (k, n), {"transpose_a": True}, "matmul transpose_a"),
-        ((2, k, 3), (k, n), {"transpose_a": True}, "broadcast transpose_a"),
+        (
+            (k, 3),
+            (n, k),
+            {"transpose_a": True, "transpose_b": True},
+            "matmul transpose_a transpose_b",
+        ),
+        ((3, k), (2, k, n), {}, "broadcast"),
+        ((2, 3, k), (2, k, n), {}, "batched"),
     ]
     for dtype in [flow.float16, flow.bfloat16]:
         for a, b, kwargs, desc in cases:
@@ -144,12 +151,12 @@ class TestMatmulLongK(flow.unittest.TestCase):
             _check(
                 test_case,
                 flow.float16,
-                (640, 1 << 15),
-                (2048, 1 << 15),
+                (1040, 1 << 15),
+                (1024, 1 << 15),
                 lambda x, y: flow.matmul(x, y, transpose_b=True),
                 "matmul transpose_b, output in pieces",
             )
-            with _env("ONEFLOW_EP_CUDA_LONG_K_GEMM_MAX_TILE_SIZE", str(1 << 15)):
+            with _env("ONEFLOW_EP_CUDA_LONG_K_GEMM_MAX_TILE_SIZE", "256"):
                 _check_row_tiles(test_case)
 
     def test_matmul_long_k_without_workspace(test_case):
