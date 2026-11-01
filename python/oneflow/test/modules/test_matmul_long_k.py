@@ -56,6 +56,9 @@ def _check_grouped(test_case, problems, bias):
         ys = flow._C.grouped_matmul(xs, ws)
     for i, (x, w, y) in enumerate(zip(xs, ws, ys)):
         test_case.assertEqual(y.dtype, flow.float16)
+        test_case.assertEqual(tuple(y.shape), problems[i][:2])
+        if y.numel() == 0:
+            continue
         ref = x.to(flow.float64).numpy() @ w.to(flow.float64).numpy().T
         if bias:
             ref += bs[i].to(flow.float64).numpy()
@@ -80,6 +83,9 @@ def _check_all(test_case):
     problems = [(1, 16, _K), (3, 8, _K)]
     _check_grouped(test_case, problems, True)
     _check_grouped(test_case, problems, False)
+    # Empty outputs: a weight or an input without rows.
+    for problems in [[(2, 0, _K)], [(0, 2, _K)]]:
+        _check_grouped(test_case, problems, False)
 
 
 @contextlib.contextmanager
