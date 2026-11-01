@@ -47,20 +47,21 @@ __global__ void StoreTile(int64_t rows, int64_t cols, const float* tile, float b
   }
 }
 
-// rocBLAS gemm_ex with a float D accumulates the k-chunks in float. D goes through the workspace
-// in tiles, so the workspace bounds the extra memory; rocBLAS does not use that workspace.
+// Floats in a tile of D, so the fallback needs at most 4 MiB.
+constexpr int64_t kMaxTileSize = int64_t{1} << 20;
+
+// rocBLAS gemm_ex with a float D accumulates the k-chunks in float. D goes through a float tile of
+// tile_size elements in pieces.
 template<typename T>
-hipblasStatus_t RocblasFloatOutputGemm(hipblasHandle_t handle, hipStream_t stream, void* workspace,
-                                       size_t workspace_size, hipblasOperation_t trans_a,
+hipblasStatus_t RocblasFloatOutputGemm(hipblasHandle_t handle, hipStream_t stream, float* tile,
+                                       int64_t tile_size, hipblasOperation_t trans_a,
                                        hipblasOperation_t trans_b, int64_t m, int64_t n, int64_t k,
                                        float alpha, const T* a, int64_t lda, int64_t stride_a,
                                        const T* b, int64_t ldb, int64_t stride_b, float beta, T* d,
                                        hipDataType type, int64_t ldd, int64_t stride_d,
                                        int64_t batch_count) {
-  const int64_t capacity = workspace_size / sizeof(float);
-  const int64_t tile_m = std::min(m, capacity);
-  const int64_t tile_n = std::min(n, capacity / tile_m);
-  float* tile = static_cast<float*>(workspace);
+  const int64_t tile_m = std::min(m, tile_size);
+  const int64_t tile_n = std::min(n, tile_size / tile_m);
   const float zero = 0.0f;
   for (int64_t batch = 0; batch < batch_count; ++batch) {
     for (int64_t j = 0; j < n; j += tile_n) {
@@ -105,24 +106,31 @@ hipblasStatus_t OfLongKGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle,
         stride_a, b, ldb, stride_b, beta, d, type, ldd, stride_d, batch_count);
     if (status != HIPBLAS_STATUS_NOT_SUPPORTED) { return status; }
   }
-  if (workspace_size < sizeof(float)) {
-    // No room for a float tile: the plain rocBLAS call, with its per-chunk rounding.
-    return hipblasGemmStridedBatchedEx(
-        handle, trans_a, trans_b, m, n, k, &alpha, a, type, lda, stride_a, b, type, ldb, stride_b,
-        &beta, d, type, ldd, stride_d, batch_count, HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
+  if (type != HIP_R_16F && type != HIP_R_16BF) { return HIPBLAS_STATUS_NOT_SUPPORTED; }
+  // The tile is the workspace when it is large enough (rocBLAS does not use it) and a temporary
+  // allocation otherwise, never a rocBLAS call with the 16-bit D.
+  const int64_t tile_size = std::min(m * n, kMaxTileSize);
+  void* tile = workspace;
+  if (workspace_size < tile_size * sizeof(float)) {
+    tile = nullptr;
+    if (hipMallocAsync(&tile, tile_size * sizeof(float), stream) != hipSuccess) {
+      return HIPBLAS_STATUS_ALLOC_FAILED;
+    }
   }
+  hipblasStatus_t status;
   if (type == HIP_R_16F) {
-    return RocblasFloatOutputGemm(handle, stream, workspace, workspace_size, trans_a, trans_b, m, n,
-                                  k, alpha, static_cast<const __half*>(a), lda, stride_a,
-                                  static_cast<const __half*>(b), ldb, stride_b, beta,
-                                  static_cast<__half*>(d), type, ldd, stride_d, batch_count);
-  } else if (type == HIP_R_16BF) {
-    return RocblasFloatOutputGemm(
-        handle, stream, workspace, workspace_size, trans_a, trans_b, m, n, k, alpha,
+    status = RocblasFloatOutputGemm(handle, stream, static_cast<float*>(tile), tile_size, trans_a,
+                                    trans_b, m, n, k, alpha, static_cast<const __half*>(a), lda,
+                                    stride_a, static_cast<const __half*>(b), ldb, stride_b, beta,
+                                    static_cast<__half*>(d), type, ldd, stride_d, batch_count);
+  } else {
+    status = RocblasFloatOutputGemm(
+        handle, stream, static_cast<float*>(tile), tile_size, trans_a, trans_b, m, n, k, alpha,
         static_cast<const __hip_bfloat16*>(a), lda, stride_a, static_cast<const __hip_bfloat16*>(b),
         ldb, stride_b, beta, static_cast<__hip_bfloat16*>(d), type, ldd, stride_d, batch_count);
   }
-  return HIPBLAS_STATUS_NOT_SUPPORTED;
+  if (tile != workspace) { (void)hipFreeAsync(tile, stream); }
+  return status;
 }
 
 #endif  // defined(WITH_CUDA) && defined(USE_HIP)

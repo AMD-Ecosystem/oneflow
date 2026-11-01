@@ -142,8 +142,8 @@ inline hipblasStatus_t OfHipblasLtGemm(hipblasLtHandle_t handle, hipStream_t str
 }
 
 // The GEMM OfRocblasSplitsK selects: OfHipblasLtGemm, or, when hipBLASLt has no algorithm for the
-// shape (or ONEFLOW_EP_CUDA_LONG_K_GEMM_USE_HIPBLASLT=0), rocBLAS with a float D in tiles of the
-// workspace, rounded to the 16-bit D once.
+// shape (or ONEFLOW_EP_CUDA_LONG_K_GEMM_USE_HIPBLASLT=0), rocBLAS with a float D in tiles,
+// rounded to the 16-bit D once.
 hipblasStatus_t OfLongKGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle, hipStream_t stream,
                             void* workspace, size_t workspace_size, hipblasOperation_t trans_a,
                             hipblasOperation_t trans_b, int64_t m, int64_t n, int64_t k,

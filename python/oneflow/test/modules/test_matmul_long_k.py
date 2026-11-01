@@ -15,6 +15,8 @@ limitations under the License.
 """
 import contextlib
 import os
+import subprocess
+import sys
 import unittest
 
 import numpy as np
@@ -122,6 +124,14 @@ class TestMatmulLongK(flow.unittest.TestCase):
                 lambda x, y: flow.matmul(x, y, transpose_b=True),
                 "matmul transpose_b, output in pieces",
             )
+
+    def test_matmul_long_k_without_workspace(test_case):
+        # With no cuBLAS workspace the float tiles of the fallback need their own memory. A stream
+        # reads the workspace size when it is created, so the test runs in a new process.
+        env = dict(os.environ, ONEFLOW_EP_CUDA_CUBLAS_WORKSPACE_SIZE_MB="0")
+        test = "TestMatmulLongK.test_matmul_long_k_without_hipblaslt"
+        result = subprocess.run([sys.executable, __file__, test], env=env)
+        test_case.assertEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":
