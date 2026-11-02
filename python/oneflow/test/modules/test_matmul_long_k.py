@@ -126,6 +126,7 @@ def _check_all(test_case):
         )
         _check(test_case, dtype, (2, 1, _K), (2, _K, 16), flow.bmm, "bmm")
         _check(test_case, dtype, (1, _K), (2, _K, 16), flow.matmul, "broadcast")
+        _check(test_case, dtype, (16, _K), (_K, 1), flow.matmul, "matrix-vector")
     problems = [(1, 16, _K), (3, 8, _K)]
     _check_grouped(test_case, problems, True)
     _check_grouped(test_case, problems, False)

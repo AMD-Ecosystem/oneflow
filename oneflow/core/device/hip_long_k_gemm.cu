@@ -42,9 +42,38 @@ __device__ __hip_bfloat16 FromFloat<__hip_bfloat16>(float x) {
   return __float2bfloat16(x);
 }
 
+constexpr int kRun = 8;
+
+// kRun consecutive k indices of op(A) or op(B) as floats, from p and every step-th element after
+// it: one 16-byte load where they are contiguous and aligned.
+template<typename T>
+__device__ void LoadRun(const T* p, int64_t step, float* x) {
+  static_assert(kRun * sizeof(T) == sizeof(uint4), "a run is one 16-byte load");
+  if (step == 1 && reinterpret_cast<uintptr_t>(p) % sizeof(uint4) == 0) {
+    const uint4 word = *reinterpret_cast<const uint4*>(p);
+    const T* values = reinterpret_cast<const T*>(&word);
+    for (int q = 0; q < kRun; ++q) { x[q] = ToFloat(values[q]); }
+  } else {
+    for (int q = 0; q < kRun; ++q) { x[q] = ToFloat(p[q * step]); }
+  }
+}
+
 constexpr int kStoreRows = 32;
 constexpr int kStoreCols = 8;
 constexpr int kStoreSteps = 32;
+// When a tile's output blocks hold fewer than 16 elements, which on random data are computed
+// again often, and there are at most kSplitBlocks / 2 of them, StoreTile runs up to kMaxSplits
+// thread blocks per output block, so that computing its elements again over all of k is spread
+// over the GPU rather than left to one compute unit. Blocks of 16 elements or more seldom are, and
+// do not pay for the split.
+constexpr int64_t kSplitBlocks = 512;
+constexpr int64_t kMaxSplits = 64;
+
+int64_t StoreSplits(int64_t rows, int64_t cols, int64_t count) {
+  if (std::min<int64_t>(rows, kStoreRows) * std::min<int64_t>(cols, kStoreCols) >= 16) { return 1; }
+  const int64_t output_blocks = CeilDiv(rows, kStoreRows) * CeilDiv(cols, kStoreCols) * count;
+  return std::max<int64_t>(1, std::min(kMaxSplits, kSplitBlocks / output_blocks));
+}
 
 // d = (the sum of the slices of tile) + beta * d for `count` rows x cols blocks of column-major
 // matrices, block b at d + b * stride_d. tile holds `slices` x count column-major rows x cols
@@ -58,21 +87,29 @@ constexpr int kStoreSteps = 32;
 // (blocks at stride_a and stride_b) as float dot products over all of k, as a single GEMM
 // accumulating in float gives them, when any element's slices do not sum to a finite value or
 // their root-sum-square exceeds sqrt(3) times the block's largest result, where the slices'
-// expected rounding error would pass that result's own. Inputs that hold inf or NaN give non-finite
-// results either way.
+// expected rounding error would pass that result's own. That is a criterion on the expected
+// error, not a bound: slices that all round the same way can still lose several ulp. Inputs that
+// hold inf or NaN give non-finite results either way. With splits > 1, each output block has that
+// many thread blocks, which each take a share of k and leave their sums in `partials`; the last
+// of them to finish, counted in `arrived` (zero on entry), adds them in order and writes d.
 template<typename T, typename P>
-__global__ void StoreTile(int64_t rows, int64_t cols, int64_t count, int64_t slices, const P* tile,
-                          float beta, T* d, int64_t ldd, int64_t stride_d, bool trans_a,
-                          bool trans_b, int64_t k, float alpha, const T* a, int64_t lda,
-                          int64_t stride_a, const T* b, int64_t ldb, int64_t stride_b) {
+__global__ void __launch_bounds__(kStoreRows* kStoreCols)
+    StoreTile(int64_t rows, int64_t cols, int64_t count, int64_t slices, const P* tile, float beta,
+              T* d, int64_t ldd, int64_t stride_d, bool trans_a, bool trans_b, int64_t k,
+              float alpha, const T* a, int64_t lda, int64_t stride_a, const T* b, int64_t ldb,
+              int64_t stride_b, int64_t splits, double* partials, unsigned int* arrived) {
   __shared__ float shared_a[kStoreRows][kStoreSteps + 1];
   __shared__ float shared_b[kStoreSteps][kStoreCols + 1];
   __shared__ float wave_max[kStoreRows * kStoreCols];
+  __shared__ double partial[kStoreRows * kStoreCols];
+  __shared__ bool last;
   const int64_t size = rows * cols;
   const int64_t blocks_m = CeilDiv(rows, kStoreRows);
   const int64_t blocks = blocks_m * CeilDiv(cols, kStoreCols);
   const int tid = threadIdx.y * kStoreRows + threadIdx.x;
-  for (int64_t t = blockIdx.x; t < blocks * count; t += gridDim.x) {
+  for (int64_t u = blockIdx.x; u < blocks * count * splits; u += gridDim.x) {
+    const int64_t t = splits == 1 ? u : u / splits;
+    const int64_t split = splits == 1 ? 0 : u % splits;
     const int64_t c = t / blocks;
     const int64_t i0 = t % blocks % blocks_m * kStoreRows;
     const int64_t j0 = t % blocks / blocks_m * kStoreCols;
@@ -101,34 +138,105 @@ __global__ void StoreTile(int64_t rows, int64_t cols, int64_t count, int64_t sli
       }
       again = __syncthreads_or(inside && !(isfinite(v) && squares <= 3.0f * largest * largest));
     }
+    if (!again && split > 0) { continue; }
     if (again) {
       const T* block_a = a + c * stride_a;
       const T* block_b = b + c * stride_b;
+      const int64_t share = CeilDiv(CeilDiv(k, splits), kStoreSteps) * kStoreSteps;
+      const int64_t begin = std::min(k, split * share);
+      const int64_t end = std::min(k, begin + share);
+      const int valid_rows = static_cast<int>(std::min<int64_t>(rows - i0, kStoreRows));
+      const int valid_cols = static_cast<int>(std::min<int64_t>(cols - j0, kStoreCols));
       double sum = 0.0;
-      for (int64_t l0 = 0; l0 < k; l0 += kStoreSteps) {
-        // Each step reads op(A)(i0.., l0..) and op(B)(l0.., j0..) along their contiguous index.
-        for (int q = 0; q < kStoreRows * kStoreSteps / (kStoreRows * kStoreCols); ++q) {
-          const int e = q * kStoreRows * kStoreCols + tid;
-          const int ar = trans_a ? e / kStoreSteps : e % kStoreRows;
-          const int al = trans_a ? e % kStoreSteps : e / kStoreRows;
-          const bool ok = i0 + ar < rows && l0 + al < k;
-          shared_a[ar][al] = ok ? ToFloat(trans_a ? block_a[l0 + al + (i0 + ar) * lda]
-                                                  : block_a[i0 + ar + (l0 + al) * lda])
+      if (2 * valid_rows * valid_cols > kStoreRows * kStoreCols) {
+        for (int64_t l0 = begin; l0 < end; l0 += kStoreSteps) {
+          // Each step reads op(A)(i0.., l0..) and op(B)(l0.., j0..) along their contiguous index.
+          for (int q = 0; q < kStoreRows * kStoreSteps / (kStoreRows * kStoreCols); ++q) {
+            const int e = q * kStoreRows * kStoreCols + tid;
+            const int ar = trans_a ? e / kStoreSteps : e % kStoreRows;
+            const int al = trans_a ? e % kStoreSteps : e / kStoreRows;
+            const bool ok = i0 + ar < rows && l0 + al < end;
+            shared_a[ar][al] = ok ? ToFloat(trans_a ? block_a[l0 + al + (i0 + ar) * lda]
+                                                    : block_a[i0 + ar + (l0 + al) * lda])
+                                  : 0.0f;
+          }
+          const int bl = trans_b ? tid / kStoreCols : tid % kStoreSteps;
+          const int bc = trans_b ? tid % kStoreCols : tid / kStoreSteps;
+          const bool ok = j0 + bc < cols && l0 + bl < end;
+          shared_b[bl][bc] = ok ? ToFloat(trans_b ? block_b[j0 + bc + (l0 + bl) * ldb]
+                                                  : block_b[l0 + bl + (j0 + bc) * ldb])
                                 : 0.0f;
+          __syncthreads();
+          float part = 0.0f;
+          for (int q = 0; q < kStoreSteps; ++q) {
+            part = fmaf(shared_a[threadIdx.x][q], shared_b[q][threadIdx.y], part);
+          }
+          sum += part;
+          __syncthreads();
         }
-        const int bl = trans_b ? tid / kStoreCols : tid % kStoreSteps;
-        const int bc = trans_b ? tid % kStoreCols : tid / kStoreSteps;
-        const bool ok = j0 + bc < cols && l0 + bl < k;
-        shared_b[bl][bc] = ok ? ToFloat(trans_b ? block_b[j0 + bc + (l0 + bl) * ldb]
-                                                : block_b[l0 + bl + (j0 + bc) * ldb])
-                              : 0.0f;
-        __syncthreads();
-        float part = 0.0f;
-        for (int q = 0; q < kStoreSteps; ++q) {
-          part = fmaf(shared_a[threadIdx.x][q], shared_b[q][threadIdx.y], part);
+      } else {
+        // At most half the threads have an element: give each element `parts` threads, the
+        // power-of-two share of the block, which take every parts-th k index and are added after.
+        int block_rows = 1;
+        while (block_rows < valid_rows) { block_rows *= 2; }
+        int block_cols = 1;
+        while (block_cols < valid_cols) { block_cols *= 2; }
+        const int parts = kStoreRows * kStoreCols / (block_rows * block_cols);
+        const int part = tid % parts;
+        const int er = tid / parts % block_rows;
+        const int ec = tid / parts / block_rows;
+        if (er < valid_rows && ec < valid_cols) {
+          const T* row_a = block_a + (i0 + er) * (trans_a ? lda : 1);
+          const int64_t step_a = trans_a ? 1 : lda;
+          const T* col_b = block_b + (j0 + ec) * (trans_b ? 1 : ldb);
+          const int64_t step_b = trans_b ? ldb : 1;
+          // Runs of kRun consecutive k indices, every parts-th run to this thread.
+          const int64_t runs = (end - begin) / kRun;
+          float part_sum = 0.0f;
+          int terms = 0;
+          for (int64_t j = part; j < runs; j += parts) {
+            float run_a[kRun];
+            float run_b[kRun];
+            const int64_t l = begin + j * kRun;
+            LoadRun(row_a + l * step_a, step_a, run_a);
+            LoadRun(col_b + l * step_b, step_b, run_b);
+            for (int q = 0; q < kRun; ++q) { part_sum = fmaf(run_a[q], run_b[q], part_sum); }
+            terms += kRun;
+            if (terms == kStoreSteps) {
+              sum += part_sum;
+              part_sum = 0.0f;
+              terms = 0;
+            }
+          }
+          if (part == 0) {
+            for (int64_t l = begin + runs * kRun; l < end; ++l) {
+              part_sum = fmaf(ToFloat(row_a[l * step_a]), ToFloat(col_b[l * step_b]), part_sum);
+            }
+          }
+          sum += part_sum;
         }
-        sum += part;
+        partial[tid] = sum;
         __syncthreads();
+        for (int width = parts / 2; width > 0; width /= 2) {
+          if (part < width) { partial[tid] += partial[tid + width]; }
+          __syncthreads();
+        }
+        if (inside) { sum = partial[(threadIdx.x + threadIdx.y * block_rows) * parts]; }
+      }
+      if (splits > 1) {
+        double* sums = partials + t * splits * (kStoreRows * kStoreCols);
+        sums[split * (kStoreRows * kStoreCols) + tid] = sum;
+        __threadfence();
+        __syncthreads();
+        if (tid == 0) { last = atomicAdd(arrived + t, 1u) == splits - 1; }
+        __syncthreads();
+        if (!last) { continue; }
+        __threadfence();
+        sum = 0.0;
+        for (int64_t s = 0; s < splits; ++s) {
+          sum += __hip_atomic_load(sums + s * (kStoreRows * kStoreCols) + tid, __ATOMIC_RELAXED,
+                                   __HIP_MEMORY_SCOPE_AGENT);
+        }
       }
       v = alpha * static_cast<float>(sum);
     }
@@ -203,10 +311,10 @@ hipblasStatus_t ChunkProducts(hipblasHandle_t handle, hipblasLtHandle_t lt_handl
 // k-chunks; the tile holds either.
 template<typename T>
 hipblasStatus_t TiledGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle, hipStream_t stream,
-                          void* workspace, size_t workspace_size, void* tile, int64_t tile_m,
-                          int64_t tile_n, int64_t tile_count, bool chunked, int64_t chunk,
-                          hipblasOperation_t trans_a, hipblasOperation_t trans_b, int64_t m,
-                          int64_t n, int64_t k, float alpha, const T* a, int64_t lda,
+                          void* workspace, size_t workspace_size, void* tile, void* split_space,
+                          int64_t tile_m, int64_t tile_n, int64_t tile_count, bool chunked,
+                          int64_t chunk, hipblasOperation_t trans_a, hipblasOperation_t trans_b,
+                          int64_t m, int64_t n, int64_t k, float alpha, const T* a, int64_t lda,
                           int64_t stride_a, const T* b, int64_t ldb, int64_t stride_b, float beta,
                           T* d, hipDataType type, int64_t ldd, int64_t stride_d,
                           int64_t batch_count) {
@@ -222,9 +330,13 @@ hipblasStatus_t TiledGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle, h
         const T* tile_b = b + batch * stride_b + (trans_b == HIPBLAS_OP_N ? j * ldb : j);
         T* tile_d = d + batch * stride_d + i + j * ldd;
         const dim3 threads(kStoreRows, kStoreCols);
-        // One block per output block: StoreTile synchronizes its threads for each.
-        const int64_t blocks = std::min<int64_t>(
-            CeilDiv(rows, kStoreRows) * CeilDiv(cols, kStoreCols) * count, int64_t{1} << 20);
+        // One block per output block and split: StoreTile synchronizes its threads for each.
+        const int64_t output_blocks = CeilDiv(rows, kStoreRows) * CeilDiv(cols, kStoreCols) * count;
+        const int64_t splits = chunked ? StoreSplits(rows, cols, count) : 1;
+        const int64_t blocks = std::min<int64_t>(output_blocks * splits, int64_t{1} << 20);
+        double* partials = static_cast<double*>(split_space);
+        unsigned int* arrived =
+            reinterpret_cast<unsigned int*>(partials + kSplitBlocks * kStoreRows * kStoreCols);
         const bool ta = trans_a != HIPBLAS_OP_N;
         const bool tb = trans_b != HIPBLAS_OP_N;
         hipblasStatus_t status = HIPBLAS_STATUS_NOT_SUPPORTED;
@@ -232,10 +344,16 @@ hipblasStatus_t TiledGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle, h
           status = ChunkProducts(handle, lt_handle, stream, workspace, workspace_size, trans_a,
                                  trans_b, rows, cols, k, chunk, alpha, tile_a, lda, stride_a,
                                  tile_b, ldb, stride_b, count, static_cast<T*>(tile), type);
+          if (status == HIPBLAS_STATUS_SUCCESS && splits > 1
+              && hipMemsetAsync(arrived, 0, output_blocks * sizeof(unsigned int), stream)
+                     != hipSuccess) {
+            return HIPBLAS_STATUS_EXECUTION_FAILED;
+          }
           if (status == HIPBLAS_STATUS_SUCCESS) {
             StoreTile<T, T><<<blocks, threads, 0, stream>>>(
                 rows, cols, count, slices, static_cast<const T*>(tile), beta, tile_d, ldd, stride_d,
-                ta, tb, k, alpha, tile_a, lda, stride_a, tile_b, ldb, stride_b);
+                ta, tb, k, alpha, tile_a, lda, stride_a, tile_b, ldb, stride_b, splits, partials,
+                arrived);
           }
         }
         if (status == HIPBLAS_STATUS_NOT_SUPPORTED) {
@@ -250,7 +368,8 @@ hipblasStatus_t TiledGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle, h
           if (status == HIPBLAS_STATUS_SUCCESS) {
             StoreTile<T, float><<<blocks, threads, 0, stream>>>(
                 rows, cols, count, 1, float_tile, beta, tile_d, ldd, stride_d, ta, tb, k, alpha,
-                static_cast<const T*>(nullptr), lda, stride_a, tile_b, ldb, stride_b);
+                static_cast<const T*>(nullptr), lda, stride_a, tile_b, ldb, stride_b, 1, nullptr,
+                nullptr);
           }
         }
         if (status != HIPBLAS_STATUS_SUCCESS) { return status; }
@@ -333,8 +452,18 @@ hipblasStatus_t OfLongKGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle,
     tile_m = BalancedPiece(m, max_outputs);
     tile_n = BalancedPiece(n, std::max<int64_t>(1, max_outputs / tile_m));
   }
+  // Space for StoreTile's split sums when some tile is split; if any is, the last tile in each
+  // dimension, the smallest, is.
+  const int64_t last_m = m - (CeilDiv(m, tile_m) - 1) * tile_m;
+  const int64_t last_n = n - (CeilDiv(n, tile_n) - 1) * tile_n;
+  const int64_t last_count = batch_count - (CeilDiv(batch_count, tile_count) - 1) * tile_count;
+  const bool split = chunked && StoreSplits(last_m, last_n, last_count) > 1;
+  const size_t split_bytes = split ? kSplitBlocks * kStoreRows * kStoreCols * sizeof(double)
+                                         + kSplitBlocks * sizeof(unsigned int)
+                                   : 0;
   // 256-byte aligned, as hipBLASLt expects of its workspace.
-  const size_t tile_bytes = (tile_m * tile_n * tile_count * units * 2 + 255) / 256 * 256;
+  const size_t slice_bytes = (tile_m * tile_n * tile_count * units * 2 + 255) / 256 * 256;
+  const size_t tile_bytes = slice_bytes + (split_bytes + 255) / 256 * 256;
   void* tile = workspace;
   void* lt_workspace = workspace;
   size_t lt_workspace_size = workspace_size;
@@ -346,17 +475,18 @@ hipblasStatus_t OfLongKGemm(hipblasHandle_t handle, hipblasLtHandle_t lt_handle,
   }
   hipblasStatus_t status;
   if (type == HIP_R_16F) {
-    status =
-        TiledGemm(handle, lt_handle, stream, lt_workspace, lt_workspace_size, tile, tile_m, tile_n,
-                  tile_count, chunked, chunk, trans_a, trans_b, m, n, k, alpha,
-                  static_cast<const __half*>(a), lda, stride_a, static_cast<const __half*>(b), ldb,
-                  stride_b, beta, static_cast<__half*>(d), type, ldd, stride_d, batch_count);
+    status = TiledGemm(handle, lt_handle, stream, lt_workspace, lt_workspace_size, tile,
+                       static_cast<char*>(tile) + slice_bytes, tile_m, tile_n, tile_count, chunked,
+                       chunk, trans_a, trans_b, m, n, k, alpha, static_cast<const __half*>(a), lda,
+                       stride_a, static_cast<const __half*>(b), ldb, stride_b, beta,
+                       static_cast<__half*>(d), type, ldd, stride_d, batch_count);
   } else {
-    status = TiledGemm(handle, lt_handle, stream, lt_workspace, lt_workspace_size, tile, tile_m,
-                       tile_n, tile_count, chunked, chunk, trans_a, trans_b, m, n, k, alpha,
-                       static_cast<const __hip_bfloat16*>(a), lda, stride_a,
-                       static_cast<const __hip_bfloat16*>(b), ldb, stride_b, beta,
-                       static_cast<__hip_bfloat16*>(d), type, ldd, stride_d, batch_count);
+    status =
+        TiledGemm(handle, lt_handle, stream, lt_workspace, lt_workspace_size, tile,
+                  static_cast<char*>(tile) + slice_bytes, tile_m, tile_n, tile_count, chunked,
+                  chunk, trans_a, trans_b, m, n, k, alpha, static_cast<const __hip_bfloat16*>(a),
+                  lda, stride_a, static_cast<const __hip_bfloat16*>(b), ldb, stride_b, beta,
+                  static_cast<__hip_bfloat16*>(d), type, ldd, stride_d, batch_count);
   }
   if (tile != workspace) { (void)hipFreeAsync(tile, stream); }
   return status;
