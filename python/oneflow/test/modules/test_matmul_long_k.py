@@ -80,6 +80,39 @@ def _check_partial_sum_overflow(test_case):
     _check_values(test_case, flow.float16, x, dy, fn, "inf and NaN inputs")
 
 
+def _check_rounding_aligned(test_case):
+    # Dot products of ones whose 2^15-long chunk sums, all but one of magnitude 2^(bits - 1),
+    # lie just short of a rounding midpoint of dtype and so all round the same way: rounded per
+    # chunk they lose about 9 units of the result's last place, though no sum is large. The
+    # outputs are one element and an 8 x 33 matrix, which is a full block and a narrow one.
+    k, chunk = _K, 1 << 15
+    for dtype in [flow.float16, flow.bfloat16]:
+        bits = _SIGNIFICAND_BITS[dtype]
+        base = 2.0 ** (bits - 1)
+        step = base / chunk
+        dy = np.zeros(k)
+        for s in range(k // chunk - 1):
+            seg = slice(s * chunk, (s + 1) * chunk)
+            if s % 2 == 0 or s >= 28:
+                # A chunk sum of base + 1/2 - 2^-bits, which rounds down.
+                dy[seg] = step
+                dy[s * chunk] = 0.5 - 2.0 ** -bits + step
+            else:
+                # A chunk sum of -(base + 1/2 + 2^-bits), which rounds down too.
+                dy[seg] = -step
+                dy[s * chunk] = -0.5 - 2.0 ** -bits - step
+        dy[k - chunk : k - chunk + 16] = base / 32
+        for m, n in [(1, 1), (8, 33)]:
+            _check_values(
+                test_case,
+                dtype,
+                np.ones((m, k)),
+                np.repeat(dy[:, None], n, axis=1),
+                flow.matmul,
+                "chunk sums rounding alike (%d, %d)" % (m, n),
+            )
+
+
 def _check_grouped(test_case, problems, bias):
     # grouped_matmul_bias computes x * w^T + b per problem (m, n, k), in float16 only.
     rng = np.random.RandomState(0)
@@ -146,6 +179,7 @@ def _check_all(test_case):
     for problems in [[(2, 0, _K)], [(0, 2, _K)]]:
         _check_grouped(test_case, problems, False)
     _check_partial_sum_overflow(test_case)
+    _check_rounding_aligned(test_case)
 
 
 def _check_row_tiles(test_case):

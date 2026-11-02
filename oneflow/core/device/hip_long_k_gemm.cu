@@ -42,6 +42,33 @@ __device__ __hip_bfloat16 FromFloat<__hip_bfloat16>(float x) {
   return __float2bfloat16(x);
 }
 
+// The unit roundoff (2^-bits for a significand of that many bits) and smallest normal of each type.
+template<typename T>
+struct Precision;
+template<>
+struct Precision<float> {
+  static constexpr float kUnitRoundoff = 0x1p-24f;
+  static constexpr float kSmallestNormal = 0x1p-126f;
+};
+template<>
+struct Precision<__half> {
+  static constexpr float kUnitRoundoff = 0x1p-11f;
+  static constexpr float kSmallestNormal = 0x1p-14f;
+};
+template<>
+struct Precision<__hip_bfloat16> {
+  static constexpr float kUnitRoundoff = 0x1p-8f;
+  static constexpr float kSmallestNormal = 0x1p-126f;
+};
+
+// At most how far x, a normal value rounded to P, can be from the value it was rounded from: half
+// an ulp of P, from x's exponent. 0 below P's smallest normal; inf for inf.
+template<typename P>
+__device__ float HalfUlp(float x) {
+  if (!(fabsf(x) >= Precision<P>::kSmallestNormal)) { return 0.0f; }
+  return __int_as_float(__float_as_int(x) & 0x7f800000) * Precision<P>::kUnitRoundoff;
+}
+
 constexpr int kRun = 8;
 
 // kRun consecutive k indices of op(A) or op(B) as floats, from p and every step-th element after
@@ -86,12 +113,12 @@ int64_t StoreSplits(int64_t rows, int64_t cols, int64_t count) {
 // is null, the elements of each kStoreRows x kStoreCols block are computed again from a and b
 // (blocks at stride_a and stride_b) as float dot products over all of k, as a single GEMM
 // accumulating in float gives them, when any element's slices do not sum to a finite value or
-// their root-sum-square exceeds sqrt(3) times the block's largest result, where the slices'
-// expected rounding error would pass that result's own. That is a criterion on the expected
-// error, not a bound: slices that all round the same way can still lose several ulp. Inputs that
-// hold inf or NaN give non-finite results either way. With splits > 1, each output block has that
-// many thread blocks, which each take a share of k and leave their sums in `partials`; the last
-// of them to finish, counted in `arrived` (zero on entry), adds them in order and writes d.
+// could be off by more than 3 units of roundoff of T times the block's largest result. That bound
+// is the sum of half an ulp of each slice and of each partial sum in float; all it leaves out is
+// half the smallest subnormal step of P for each slice below P's smallest normal. Inputs that hold
+// inf or NaN give non-finite results either way. With splits > 1, each output block has that many
+// thread blocks, which each take a share of k and leave their sums in `partials`; the last of them
+// to finish, counted in `arrived` (zero on entry), adds them in order and writes d.
 template<typename T, typename P>
 __global__ void __launch_bounds__(kStoreRows* kStoreCols)
     StoreTile(int64_t rows, int64_t cols, int64_t count, int64_t slices, const P* tile, float beta,
@@ -117,12 +144,13 @@ __global__ void __launch_bounds__(kStoreRows* kStoreCols)
     const int64_t col = j0 + threadIdx.y;
     const bool inside = r < rows && col < cols;
     float v = 0.0f;
-    float squares = 0.0f;
+    float error = 0.0f;
     if (inside) {
       for (int64_t s = 0; s < slices; ++s) {
         const float x = ToFloat(tile[c * size + r + col * rows + s * size * count]);
         v += x;
-        squares += x * x;
+        // The slice's rounding to P, and the addition's rounding to float.
+        error += HalfUlp<P>(x) + HalfUlp<float>(v);
       }
     }
     bool again = false;
@@ -136,7 +164,8 @@ __global__ void __launch_bounds__(kStoreRows* kStoreCols)
       for (int w = 0; w < kStoreRows * kStoreCols / warpSize; ++w) {
         largest = fmaxf(largest, wave_max[w]);
       }
-      again = __syncthreads_or(inside && !(isfinite(v) && squares <= 3.0f * largest * largest));
+      const float budget = 3.0f * Precision<T>::kUnitRoundoff * largest;
+      again = __syncthreads_or(inside && !(isfinite(v) && error <= budget));
     }
     if (!again && split > 0) { continue; }
     if (again) {
