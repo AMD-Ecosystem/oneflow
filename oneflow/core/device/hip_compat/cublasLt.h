@@ -15,7 +15,10 @@ limitations under the License.
 */
 #pragma once
 #include "oneflow/core/device/cuda_to_hip.h"
+#include <cublas_v2.h>
 #include <hipblaslt/hipblaslt.h>
+#include <mutex>
+#include <unordered_map>
 
 // The subset of the cuBLASLt API that oneflow's fused matmul kernels call, implemented on
 // hipBLASLt. Only the HIP build sees this header (it shadows <cublasLt.h> on the HIP include path).
@@ -34,12 +37,66 @@ limitations under the License.
 //    bit mask.
 //  - BIAS, RELU, RELU_BIAS, BGRADA and BGRADB for data types hipBLASLt has no such kernel for.
 //  - COMPUTE_16F, which hipBLASLt rejects: the GEMM runs with 32-bit compute and float scalars.
+//
+// A 16-bit GEMM for which OfUseLongKGemm holds runs as OfLongKGemm, as in oneflow's matmul, with
+// every requested epilogue in the fallback kernels after it. OfLongKGemm also calls rocBLAS, so
+// each handle has a rocBLAS handle of its own, created with it: a kernel may first run while its
+// stream is being captured into a graph, when the memory a rocBLAS handle allocates cannot be.
 
 // The handle is created and destroyed by host code (the stream object); the rest is used only by
 // the HIP-language kernels.
 typedef hipblasLtHandle_t cublasLtHandle_t;
-#define cublasLtCreate hipblasLtCreate
-#define cublasLtDestroy hipblasLtDestroy
+
+namespace oneflow_hip_cublaslt {
+
+inline std::mutex& BlasHandlesMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+inline std::unordered_map<hipblasLtHandle_t, hipblasHandle_t>& BlasHandles() {
+  static std::unordered_map<hipblasLtHandle_t, hipblasHandle_t> handles;
+  return handles;
+}
+
+// The rocBLAS handle created with `handle`, or null.
+inline hipblasHandle_t BlasHandle(hipblasLtHandle_t handle) {
+  std::lock_guard<std::mutex> lock(BlasHandlesMutex());
+  const auto it = BlasHandles().find(handle);
+  return it == BlasHandles().end() ? nullptr : it->second;
+}
+
+}  // namespace oneflow_hip_cublaslt
+
+inline hipblasStatus_t cublasLtCreate(hipblasLtHandle_t* handle) {
+  hipblasStatus_t status = hipblasLtCreate(handle);
+  if (status != HIPBLAS_STATUS_SUCCESS) { return status; }
+  hipblasHandle_t blas = nullptr;
+  status = hipblasCreate(&blas);
+  if (status != HIPBLAS_STATUS_SUCCESS) {
+    hipblasLtDestroy(*handle);
+    *handle = nullptr;
+    return status;
+  }
+  std::lock_guard<std::mutex> lock(oneflow_hip_cublaslt::BlasHandlesMutex());
+  oneflow_hip_cublaslt::BlasHandles()[*handle] = blas;
+  return HIPBLAS_STATUS_SUCCESS;
+}
+
+inline hipblasStatus_t cublasLtDestroy(hipblasLtHandle_t handle) {
+  hipblasHandle_t blas = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(oneflow_hip_cublaslt::BlasHandlesMutex());
+    const auto it = oneflow_hip_cublaslt::BlasHandles().find(handle);
+    if (it != oneflow_hip_cublaslt::BlasHandles().end()) {
+      blas = it->second;
+      oneflow_hip_cublaslt::BlasHandles().erase(it);
+    }
+  }
+  const hipblasStatus_t status = blas == nullptr ? HIPBLAS_STATUS_SUCCESS : hipblasDestroy(blas);
+  const hipblasStatus_t lt_status = hipblasLtDestroy(handle);
+  return status != HIPBLAS_STATUS_SUCCESS ? status : lt_status;
+}
 
 #if defined(__HIPCC__)
 
@@ -284,13 +341,14 @@ inline bool NativeAvailable(hipblasLtHandle_t handle, cublasLtMatmulDesc_t d,
 
 // The heuristic query and the matmul call must reach the same plan, so both pass the workspace
 // limit the caller uses for the pair (oneflow gives both the stream's cuBLAS workspace size).
+// Without `native`, the fallback kernels do every step they have.
 inline Plan MakePlan(hipblasLtHandle_t handle, cublasLtMatmulDesc_t d, cublasLtMatrixLayout_t a,
                      cublasLtMatrixLayout_t b, cublasLtMatrixLayout_t c, cublasLtMatrixLayout_t dl,
-                     uint64_t workspace) {
+                     uint64_t workspace, bool native = true) {
   Plan plan;
   const hipblasLtEpilogue_t e = d->epilogue;
-  auto native_or = [&](hipblasLtEpilogue_t native) {
-    return NativeAvailable(handle, d, native, a, b, c, dl, workspace);
+  auto native_or = [&](hipblasLtEpilogue_t wanted) {
+    return native && NativeAvailable(handle, d, wanted, a, b, c, dl, workspace);
   };
   switch (e) {
     case HIPBLASLT_EPILOGUE_DEFAULT: break;
@@ -454,6 +512,61 @@ hipblasStatus_t RunFallback(const Plan& plan, cublasLtMatmulDesc_t desc,
   return hipGetLastError() == hipSuccess ? HIPBLAS_STATUS_SUCCESS : HIPBLAS_STATUS_EXECUTION_FAILED;
 }
 
+inline hipblasStatus_t RunFallback(const Plan& plan, cublasLtMatmulDesc_t desc,
+                                   const cublasLtMatrixLayoutOpaque& la, const void* a,
+                                   const cublasLtMatrixLayoutOpaque& lb, const void* b,
+                                   const cublasLtMatrixLayoutOpaque& ld, void* d,
+                                   hipStream_t stream) {
+  if (!(plan.post_bias || plan.post_relu || plan.post_write_mask || plan.post_apply_mask
+        || plan.post_bgrad_rows || plan.post_bgrad_a || plan.post_bgrad_b)) {
+    return HIPBLAS_STATUS_SUCCESS;
+  }
+  switch (ld.type) {
+    case HIP_R_32F: return RunFallback<float>(plan, desc, la, a, lb, b, ld, d, stream);
+    case HIP_R_64F: return RunFallback<double>(plan, desc, la, a, lb, b, ld, d, stream);
+    case HIP_R_16F: return RunFallback<__half>(plan, desc, la, a, lb, b, ld, d, stream);
+    case HIP_R_16BF: return RunFallback<__hip_bfloat16>(plan, desc, la, a, lb, b, ld, d, stream);
+    default: return HIPBLAS_STATUS_NOT_SUPPORTED;
+  }
+}
+
+// D = alpha * op(A) * op(B) + beta * C through OfLongKGemm, then the epilogue in the fallback
+// kernels; NOT_SUPPORTED when OfUseLongKGemm does not select the GEMM. The scalars are float.
+inline hipblasStatus_t LongKMatmul(hipblasLtHandle_t handle, cublasLtMatmulDesc_t desc,
+                                   const float* alpha, const void* a, cublasLtMatrixLayout_t la,
+                                   const void* b, cublasLtMatrixLayout_t lb, const float* beta,
+                                   const void* c, cublasLtMatrixLayout_t lc, void* d,
+                                   cublasLtMatrixLayout_t ld, void* workspace,
+                                   size_t workspace_size, hipStream_t stream) {
+  const int64_t m = static_cast<int64_t>(ld->rows);
+  const int64_t n = static_cast<int64_t>(ld->cols);
+  const int64_t k = static_cast<int64_t>(desc->trans_a != HIPBLAS_OP_N ? la->rows : la->cols);
+  if (SupportedComputeType(desc->compute_type) != HIPBLAS_COMPUTE_32F || la->type != ld->type
+      || lb->type != ld->type || !OfUseLongKGemm(ld->type, k, la->ld, lb->ld)) {
+    return HIPBLAS_STATUS_NOT_SUPPORTED;
+  }
+  const Plan plan = MakePlan(handle, desc, la, lb, lc, ld, workspace_size, /*native=*/false);
+  if (plan.native != HIPBLASLT_EPILOGUE_DEFAULT) { return HIPBLAS_STATUS_NOT_SUPPORTED; }
+  const hipblasHandle_t blas = BlasHandle(handle);
+  if (blas == nullptr) { return HIPBLAS_STATUS_NOT_INITIALIZED; }
+  hipblasStatus_t status = hipblasSetStream(blas, stream);
+  if (status != HIPBLAS_STATUS_SUCCESS) { return status; }
+  // OfLongKGemm adds beta * D, so C goes to D first.
+  if (*beta != 0.0f && c != d) {
+    const size_t size = 2;
+    if (hipMemcpy2DAsync(d, ld->ld * size, c, lc->ld * size, m * size, n, hipMemcpyDeviceToDevice,
+                         stream)
+        != hipSuccess) {
+      return HIPBLAS_STATUS_EXECUTION_FAILED;
+    }
+  }
+  status =
+      OfLongKGemm(blas, handle, stream, workspace, workspace_size, desc->trans_a, desc->trans_b, m,
+                  n, k, *alpha, a, la->ld, 0, b, lb->ld, 0, *beta, d, ld->type, ld->ld, 0, 1);
+  if (status != HIPBLAS_STATUS_SUCCESS) { return status; }
+  return RunFallback(plan, desc, *la, a, *lb, b, *ld, d, stream);
+}
+
 }  // namespace oneflow_hip_cublaslt
 
 inline hipblasStatus_t cublasLtMatmulAlgoGetHeuristic(
@@ -481,9 +594,6 @@ inline hipblasStatus_t cublasLtMatmul(hipblasLtHandle_t handle, cublasLtMatmulDe
                                       cublasLtMatrixLayout_t ld, const hipblasLtMatmulAlgo_t* algo,
                                       void* workspace, size_t workspace_size, hipStream_t stream) {
   using namespace oneflow_hip_cublaslt;
-  const Plan plan = MakePlan(handle, desc, la, lb, lc, ld, workspace_size);
-  hipblasStatus_t status = ApplyDesc(desc, plan.native);
-  if (status != HIPBLAS_STATUS_SUCCESS) { return status; }
   float alpha_f = 0.f;
   float beta_f = 0.f;
   if (desc->compute_type == HIPBLAS_COMPUTE_16F) {
@@ -493,6 +603,13 @@ inline hipblasStatus_t cublasLtMatmul(hipblasLtHandle_t handle, cublasLtMatmulDe
     alpha = &alpha_f;
     beta = &beta_f;
   }
+  hipblasStatus_t status =
+      LongKMatmul(handle, desc, static_cast<const float*>(alpha), a, la, b, lb,
+                  static_cast<const float*>(beta), c, lc, d, ld, workspace, workspace_size, stream);
+  if (status != HIPBLAS_STATUS_NOT_SUPPORTED) { return status; }
+  const Plan plan = MakePlan(handle, desc, la, lb, lc, ld, workspace_size);
+  status = ApplyDesc(desc, plan.native);
+  if (status != HIPBLAS_STATUS_SUCCESS) { return status; }
   // cuBLASLt treats a null algo as a request for its heuristic's choice. hipBLASLt does not do that
   // on every GPU: on gfx1100 every double GEMM fails with a null algo. Make the query here.
   hipblasLtMatmulHeuristicResult_t heuristic;
@@ -516,17 +633,7 @@ inline hipblasStatus_t cublasLtMatmul(hipblasLtHandle_t handle, cublasLtMatmulDe
   status = hipblasLtMatmul(handle, desc->desc, alpha, a, la->layout, b, lb->layout, beta, c,
                            lc->layout, d, ld->layout, algo, workspace, workspace_size, stream);
   if (status != HIPBLAS_STATUS_SUCCESS) { return status; }
-  if (!(plan.post_bias || plan.post_relu || plan.post_write_mask || plan.post_apply_mask
-        || plan.post_bgrad_rows || plan.post_bgrad_a || plan.post_bgrad_b)) {
-    return HIPBLAS_STATUS_SUCCESS;
-  }
-  switch (ld->type) {
-    case HIP_R_32F: return RunFallback<float>(plan, desc, *la, a, *lb, b, *ld, d, stream);
-    case HIP_R_64F: return RunFallback<double>(plan, desc, *la, a, *lb, b, *ld, d, stream);
-    case HIP_R_16F: return RunFallback<__half>(plan, desc, *la, a, *lb, b, *ld, d, stream);
-    case HIP_R_16BF: return RunFallback<__hip_bfloat16>(plan, desc, *la, a, *lb, b, *ld, d, stream);
-    default: return HIPBLAS_STATUS_NOT_SUPPORTED;
-  }
+  return RunFallback(plan, desc, *la, a, *lb, b, *ld, d, stream);
 }
 
 #endif  // defined(__HIPCC__)
