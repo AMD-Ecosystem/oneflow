@@ -70,8 +70,9 @@ inline hipblasHandle_t BlasHandle(hipblasLtHandle_t handle) {
 // hipblasLtCreate zero-fills the memory it allocates with a synchronous hipMemset on the null
 // stream. While any thread is capturing a blocking stream into a graph, that memset fails with
 // hipErrorStreamCaptureImplicit and hipBLASLt exits the process. miopenCreate creates a hipBLASLt
-// handle as well. So a stream holds CaptureMutex shared while it captures, and creating either
-// handle holds it exclusively.
+// handle as well, and so do hipblasCreate and hipsolverDnCreate when rocBLAS uses hipBLASLt. So a
+// stream holds CaptureMutex shared while it captures, and creating any of these handles holds it
+// exclusively.
 inline std::shared_mutex& CaptureMutex() {
   static std::shared_mutex mutex;
   return mutex;

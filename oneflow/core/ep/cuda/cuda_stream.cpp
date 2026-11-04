@@ -175,7 +175,12 @@ CudaStream::CudaStream(CudaDevice* device)
 #endif  // defined(USE_HIP)
   }
   // cublas_handle
-  OF_CUBLAS_CHECK(cublasCreate(&cublas_handle_));
+  {
+#if defined(USE_HIP)
+    oneflow_hip_cublaslt::HandleCreationGuard guard;
+#endif  // defined(USE_HIP)
+    OF_CUBLAS_CHECK(cublasCreate(&cublas_handle_));
+  }
   OF_CUBLAS_CHECK(cublasSetStream(cublas_handle_, cuda_stream_));
   if (need_check_version) { CheckCublasVersion(cublas_handle_); }
 #if CUDA_VERSION >= 10010
@@ -189,7 +194,12 @@ CudaStream::CudaStream(CudaDevice* device)
 #endif  // CUBLAS_VERSION >= 11000
   // cusolver_dn_handle
 #if CUDA_VERSION >= 11000
-  OF_CUSOLVER_CHECK(cusolverDnCreate(&cusolver_dn_handle_));
+  {
+#if defined(USE_HIP)
+    oneflow_hip_cublaslt::HandleCreationGuard guard;
+#endif  // defined(USE_HIP)
+    OF_CUSOLVER_CHECK(cusolverDnCreate(&cusolver_dn_handle_));
+  }
   OF_CUSOLVER_CHECK(cusolverDnSetStream(cusolver_dn_handle_, cuda_stream_));
 #endif
   workspace_size_ =
