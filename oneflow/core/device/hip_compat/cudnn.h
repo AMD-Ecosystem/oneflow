@@ -36,6 +36,7 @@ limitations under the License.
 //    code that uses them is excluded from the HIP build, and the non-fused path runs instead.
 
 #include "oneflow/core/device/cuda_to_hip.h"
+#include <cublasLt.h>
 #include <hip/hip_runtime.h>
 #include <miopen/miopen.h>
 #include <miopen/version.h>
@@ -192,7 +193,11 @@ inline const char* cudnnGetErrorString(cudnnStatus_t status) {
   return miopenGetErrorString(status);
 }
 
-inline cudnnStatus_t cudnnCreate(miopenHandle_t* handle) { return miopenCreate(handle); }
+inline cudnnStatus_t cudnnCreate(miopenHandle_t* handle) {
+  // miopenCreate creates a hipBLASLt handle (see HandleCreationGuard).
+  oneflow_hip_cublaslt::HandleCreationGuard guard;
+  return miopenCreate(handle);
+}
 
 namespace oneflow_hip_cudnn {
 

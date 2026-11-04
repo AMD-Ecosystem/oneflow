@@ -18,6 +18,7 @@ limitations under the License.
 #include <cublas_v2.h>
 #include <hipblaslt/hipblaslt.h>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 
 // The subset of the cuBLASLt API that oneflow's fused matmul kernels call, implemented on
@@ -66,9 +67,46 @@ inline hipblasHandle_t BlasHandle(hipblasLtHandle_t handle) {
   return it == BlasHandles().end() ? nullptr : it->second;
 }
 
+// hipblasLtCreate zero-fills the memory it allocates with a synchronous hipMemset on the null
+// stream. While any thread is capturing a blocking stream into a graph, that memset fails with
+// hipErrorStreamCaptureImplicit and hipBLASLt exits the process. miopenCreate creates a hipBLASLt
+// handle as well. So a stream holds CaptureMutex shared while it captures, and creating either
+// handle holds it exclusively.
+inline std::shared_mutex& CaptureMutex() {
+  static std::shared_mutex mutex;
+  return mutex;
+}
+
+inline bool& ThreadIsCapturing() {
+  thread_local bool capturing = false;
+  return capturing;
+}
+
+inline void BeginCapture() {
+  CaptureMutex().lock_shared();
+  ThreadIsCapturing() = true;
+}
+
+inline void EndCapture() {
+  ThreadIsCapturing() = false;
+  CaptureMutex().unlock_shared();
+}
+
+class HandleCreationGuard final {
+ public:
+  // A thread that is capturing cannot wait for its own capture to end.
+  HandleCreationGuard() : lock_(CaptureMutex(), std::defer_lock) {
+    if (!ThreadIsCapturing()) { lock_.lock(); }
+  }
+
+ private:
+  std::unique_lock<std::shared_mutex> lock_;
+};
+
 }  // namespace oneflow_hip_cublaslt
 
 inline hipblasStatus_t cublasLtCreate(hipblasLtHandle_t* handle) {
+  oneflow_hip_cublaslt::HandleCreationGuard guard;
   hipblasStatus_t status = hipblasLtCreate(handle);
   if (status != HIPBLAS_STATUS_SUCCESS) { return status; }
   hipblasHandle_t blas = nullptr;

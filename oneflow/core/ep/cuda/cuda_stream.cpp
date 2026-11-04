@@ -317,12 +317,18 @@ int CudaStream::cuda_arch() const {
 void CudaStream::BeginGraphCapture() {
   CHECK(!is_graph_capturing_);
   is_graph_capturing_ = true;
+#if defined(USE_HIP)
+  oneflow_hip_cublaslt::BeginCapture();
+#endif  // defined(USE_HIP)
   OF_CUDA_CHECK(cudaStreamBeginCapture(cuda_stream_, cudaStreamCaptureModeThreadLocal));
 }
 
 void CudaStream::EndGraphCapture(CudaGraphExecutable* executable) {
   cudaGraph_t graph = nullptr;
   OF_CUDA_CHECK(cudaStreamEndCapture(cuda_stream_, &graph));
+#if defined(USE_HIP)
+  oneflow_hip_cublaslt::EndCapture();
+#endif  // defined(USE_HIP)
   executable->Update(graph);
   OF_CUDA_CHECK(cudaGraphDestroy(graph));
   is_graph_capturing_ = false;
