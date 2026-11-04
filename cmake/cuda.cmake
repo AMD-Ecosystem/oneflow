@@ -44,6 +44,14 @@ if(BUILD_CUDA AND USE_HIP)
 
   set(CUDA_VERSION "0.0" CACHE STRING "" FORCE) # unused on HIP; satisfies version guards
 
+  # The ROCm clang finds LLVM's <libunwind.h> ahead of the system one, while FindUnwind
+  # finds the system (GNU) libunwind library. The two disagree: GNU's header maps
+  # unw_getcontext and friends to _Ux86_64_* macros, LLVM's declares them as plain symbols,
+  # so liboneflow.so would reference unw_getcontext, which GNU libunwind does not define,
+  # and fail to load. Skip libunwind for both the backtrace code and glog (included later
+  # from third_party.cmake); both fall back to _Unwind_Backtrace from <unwind.h>.
+  set(CMAKE_DISABLE_FIND_PACKAGE_Unwind ON)
+
   # Wavefront width for the target arch, visible in BOTH the host and device passes of
   # each .cu (the warp-tiled reductions in core/cuda/{softmax,layer_norm,rms_norm}.cuh
   # use it as a kernel template arg, so it must be one compile-time constant; __GFX9__
