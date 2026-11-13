@@ -74,14 +74,14 @@ def _test_id_shuffle(test_case, has_table_id, num_tables):
     np_num_unique = np_unique_ids.size
     test_case.assertTrue(np.array_equal(np_num_unique, num_unique_matrix[0]))
     test_case.assertTrue(np.array_equal(np_num_unique, cur_rank_num_unique[0]))
-    reversed_ids = cur_rank_unique_ids[cur_rank_inverse_indices][
+    reversed_ids = cur_rank_unique_ids[cur_rank_inverse_indices[:np_num_unique]][
         inverse_unique_partition_indices
     ]
     test_case.assertTrue(np.array_equal(reversed_ids.numpy(), ids))
     if has_table_id:
-        reversed_table_ids = cur_rank_unique_table_ids[cur_rank_inverse_indices][
-            inverse_unique_partition_indices
-        ]
+        reversed_table_ids = cur_rank_unique_table_ids[
+            cur_rank_inverse_indices[:np_num_unique]
+        ][inverse_unique_partition_indices]
         test_case.assertTrue(np.array_equal(reversed_table_ids.numpy(), table_ids))
     # when has_table_id=False, we can not test table ids because in this case same ids not lead to same table id
 
@@ -275,12 +275,12 @@ def _test_embedding_gradient_shuffle(test_case, enable_quantize, fp16, embedding
 
         np_cur_rank_unique_embedding_grad[k, :] = np_data
 
-    reversed_ids = cur_rank_unique_ids[cur_rank_inverse_indices][
+    reversed_ids = cur_rank_unique_ids[cur_rank_inverse_indices[:np_num_unique]][
         inverse_unique_partition_indices
     ]
     test_case.assertTrue(np.array_equal(reversed_ids.numpy(), ids))
     of_cur_rank_embedding_grad = cur_rank_unique_embedding_grad[
-        cur_rank_inverse_indices
+        cur_rank_inverse_indices[:np_num_unique]
     ][inverse_unique_partition_indices]
     of_cur_rank_embedding_grad = flow.reshape(
         of_cur_rank_embedding_grad, (-1, embedding_size)

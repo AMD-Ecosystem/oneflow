@@ -128,12 +128,12 @@ def _test_embedding_gradient_shuffle(test_case, enable_quantize, fp16, embedding
 
         np_cur_rank_unique_embedding_grad[k, :] = np_data
 
-    reversed_ids = cur_rank_unique_ids[cur_rank_inverse_indices][
+    reversed_ids = cur_rank_unique_ids[cur_rank_inverse_indices[:np_num_unique]][
         inverse_unique_partition_indices
     ]
     test_case.assertTrue(np.array_equal(reversed_ids.numpy(), ids))
     of_cur_rank_embedding_grad = cur_rank_unique_embedding_grad[
-        cur_rank_inverse_indices
+        cur_rank_inverse_indices[:np_num_unique]
     ][inverse_unique_partition_indices]
     of_cur_rank_embedding_grad = flow.reshape(
         of_cur_rank_embedding_grad, (-1, embedding_size)
