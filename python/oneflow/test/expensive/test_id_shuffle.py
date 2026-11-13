@@ -259,8 +259,22 @@ def _test_embedding_gradient_shuffle(test_case, enable_quantize, fp16, embedding
     embedding_grad = embedding_grad.reshape(-1, embedding_size)
     if fp16:
         embedding_grad = embedding_grad.astype(np.float16)
+    # The op adds each id's float16 rows with atomics, in no fixed order, rounding every
+    # add to float16, so its result depends on the order. Compare it with the exact sum,
+    # within the error bound of float16 recursive summation in any order:
+    # |error| <= gamma(n - 1) * sum(|x|), gamma(m) = m * u / (1 - m * u), u = 2**-11.
+    check_fp16_sum_bound = fp16 and not enable_quantized_comm
+    np_exact_grad = np.zeros((np_num_unique, embedding_size), dtype=np.float64)
+    np_error_bound = np.zeros((np_num_unique, embedding_size), dtype=np.float64)
     for k in range(np_num_unique):
-        np_data = sum(embedding_grad[np.where(ids.flatten() == np_unique_ids[k])[0]])
+        np_rows = embedding_grad[np.where(ids.flatten() == np_unique_ids[k])[0]]
+        np_data = sum(np_rows)
+        if check_fp16_sum_bound:
+            m = (np_rows.shape[0] - 1) * 2.0 ** -11
+            np_exact_grad[k, :] = np_rows.astype(np.float64).sum(axis=0)
+            np_error_bound[k, :] = (
+                m / (1 - m) * np.abs(np_rows.astype(np.float64)).sum(axis=0)
+            )
         # Quantize Embedding Gradient.
         if enable_quantized_comm:
             abs_max_factor = np.max(np.abs(np_data))
@@ -289,14 +303,25 @@ def _test_embedding_gradient_shuffle(test_case, enable_quantize, fp16, embedding
     if fp16:
         np_cur_rank_embedding_grad = np_cur_rank_embedding_grad.astype(np.float32)
 
-    test_case.assertTrue(
-        np.allclose(
-            of_cur_rank_embedding_grad.numpy().flatten(),
-            np_cur_rank_embedding_grad.flatten(),
-            atol=np_tolerance,
-            rtol=np_tolerance,
+    if check_fp16_sum_bound:
+        test_case.assertTrue(
+            np.all(
+                np.abs(
+                    of_cur_rank_embedding_grad.numpy().astype(np.float64)
+                    - np_exact_grad[np_inverse]
+                )
+                <= np_error_bound[np_inverse]
+            )
         )
-    )
+    else:
+        test_case.assertTrue(
+            np.allclose(
+                of_cur_rank_embedding_grad.numpy().flatten(),
+                np_cur_rank_embedding_grad.flatten(),
+                atol=np_tolerance,
+                rtol=np_tolerance,
+            )
+        )
 
 
 def _test_unique_key_value(test_case, has_table_id, num_tables):
